@@ -32,7 +32,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
-	oracle "github.com/jatorre/adbc-driver-oracle/go"
+	oracle "github.com/codeflowvt/adbc-driver-oracle/go"
 )
 
 func main() {
