@@ -53,7 +53,38 @@ const (
 	// while sizing string columns (default 64 MiB).
 	OptionIngestTypeScanLimit = "oracle.ingest.type_scan_limit_bytes"
 
+	// number_mapping selects how Oracle NUMBER columns are typed in the
+	// result Arrow schema. See the NumberMapping* constants. Defaults to
+	// NumberMappingFloat, which is the driver's historical behaviour.
+	OptionNumberMapping = "oracle.number_mapping"
+
 	DefaultPort = "1521"
+)
+
+// Accepted values for OptionNumberMapping.
+//
+// Oracle NUMBER is a base-10 type with up to 38 significant digits, so no
+// binary float can represent all of its values exactly. go-ora decodes NUMBER
+// to a full-precision decimal string on the wire; the mapping chosen here
+// decides how much of that precision survives into Arrow.
+const (
+	// NumberMappingFloat is the default: NUMBER(p,0) with p <= 18 becomes
+	// Int64, wider integral NUMBER becomes String, and everything else
+	// becomes Float64. Scaled values lose precision beyond float64's ~15-17
+	// significant digits.
+	NumberMappingFloat = "float"
+
+	// NumberMappingDecimal maps NUMBER(p,s) to Decimal128(p,s) whenever the
+	// column's declared precision and scale fit Decimal128, preserving every
+	// digit. NUMBER(p,0) with p <= 18 still maps to Int64 (already exact and
+	// half the width). NUMBER whose precision/scale cannot be represented —
+	// unconstrained NUMBER and negative scales — falls back to String rather
+	// than to a lossy float.
+	NumberMappingDecimal = "decimal"
+
+	// NumberMappingString maps every NUMBER to String. Fully lossless and
+	// schema-stable at the cost of making the column non-numeric.
+	NumberMappingString = "string"
 )
 
 var infoVendorVersion string

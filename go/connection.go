@@ -31,6 +31,10 @@ type connectionImpl struct {
 	ownsDB        bool // if true, Close() closes the db; if false, pool is shared
 	ingestWorkers int  // parallel insert workers (from database config)
 
+	// numberMapping is the NUMBER→Arrow policy for result sets, resolved to a
+	// concrete value by databaseImpl.effectiveNumberMapping.
+	numberMapping string
+
 	varcharOnce  sync.Once
 	varcharLimit int // cached inline VARCHAR2 byte cap; see inlineStringLimit
 }

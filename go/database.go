@@ -47,6 +47,10 @@ type databaseImpl struct {
 	poolSize      int // Max open connections (default: 8)
 	ingestWorkers int // Parallel insert workers (default: 1)
 
+	// numberMapping selects the Arrow type for NUMBER result columns.
+	// Empty means NumberMappingFloat. See OptionNumberMapping.
+	numberMapping string
+
 	// Connection pool — shared across all Open() calls.
 	// sql.DB is already a pool internally; we create it once and reuse.
 	pool     *sql.DB
@@ -82,6 +86,16 @@ func (db *databaseImpl) SetOption(key string, val string) error {
 		if n, err := strconv.Atoi(val); err == nil && n > 0 {
 			db.ingestWorkers = n
 		}
+	case OptionNumberMapping:
+		switch val {
+		case NumberMappingFloat, NumberMappingDecimal, NumberMappingString:
+			db.numberMapping = val
+		default:
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected %q, %q or %q",
+				OptionNumberMapping, val,
+				NumberMappingFloat, NumberMappingDecimal, NumberMappingString)
+		}
 	default:
 		return db.DatabaseImplBase.SetOption(key, val)
 	}
@@ -109,9 +123,20 @@ func (db *databaseImpl) GetOption(key string) (string, error) {
 		return db.user, nil
 	case OptionWalletLocation:
 		return db.walletLocation, nil
+	case OptionNumberMapping:
+		return db.effectiveNumberMapping(), nil
 	default:
 		return db.DatabaseImplBase.GetOption(key)
 	}
+}
+
+// effectiveNumberMapping resolves the unset value to the default, so callers
+// never have to test for "".
+func (db *databaseImpl) effectiveNumberMapping() string {
+	if db.numberMapping == "" {
+		return NumberMappingFloat
+	}
+	return db.numberMapping
 }
 
 func (db *databaseImpl) buildDSN() string {
@@ -228,6 +253,7 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		db:                 pool,
 		ownsDB:             false, // pool is owned by the database, not the connection
 		ingestWorkers:      db.ingestWorkers,
+		numberMapping:      db.effectiveNumberMapping(),
 	}
 
 	return driverbase.NewConnectionBuilder(cnxn).

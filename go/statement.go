@@ -203,7 +203,8 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 	}
 
 	impl := &oracleRecordReader{
-		rows: rows,
+		rows:          rows,
+		numberMapping: s.cnxn.numberMapping,
 	}
 
 	var rr driverbase.BaseRecordReader
@@ -1534,6 +1535,10 @@ type oracleRecordReader struct {
 	geomIndices []int
 	firstRow    []interface{}
 	hasFirstRow bool
+
+	// numberMapping is the NUMBER→Arrow policy for this result set.
+	// Empty behaves as NumberMappingFloat.
+	numberMapping string
 }
 
 func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.RecordBatch, rowIdx int) (*arrow.Schema, error) {
@@ -1575,7 +1580,7 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 		} else {
 			fields[i] = arrow.Field{
 				Name:     ct.Name(),
-				Type:     oracleTypeToArrow(ct),
+				Type:     oracleTypeToArrow(ct, r.numberMapping),
 				Nullable: nullable,
 			}
 		}
@@ -1697,7 +1702,24 @@ func (r *oracleRecordReader) Close() error {
 
 var timestampNoTZ = &arrow.TimestampType{Unit: arrow.Microsecond}
 
-func oracleTypeToArrow(ct *sql.ColumnType) arrow.DataType {
+// oracleScaleSentinel is what go-ora reports for a NUMBER whose scale arrived
+// as Oracle's -127 "floating" sentinel — that is, an unconstrained NUMBER, or
+// the result of an arithmetic expression. go-ora stores scale in a uint8 and
+// substitutes 0xFF (parameter.go: `par.Scale = 0xFF`), so it surfaces through
+// database/sql's DecimalSize as 255 rather than as 0 or -127.
+//
+// A declared negative scale — Oracle permits NUMBER(5,-3) — takes the same
+// route and wraps to 256+scale, so it also lands in the high end of the uint8
+// range (-3 → 253). numberDecimalType therefore rejects the whole band above
+// arrow's maximum precision rather than testing for 255 alone; NUMBER(p,-1)
+// would be indistinguishable from the sentinel anyway.
+const oracleScaleSentinel = 255
+
+// maxDecimal128Precision is both Decimal128's limit and Oracle NUMBER's
+// maximum precision, so every *constrained* NUMBER fits.
+const maxDecimal128Precision = 38
+
+func oracleTypeToArrow(ct *sql.ColumnType, numberMapping string) arrow.DataType {
 	dbType := strings.ToUpper(ct.DatabaseTypeName())
 
 	// Note: go-ora's ColumnType.DatabaseTypeName returns TNS wire-type names
@@ -1706,13 +1728,7 @@ func oracleTypeToArrow(ct *sql.ColumnType) arrow.DataType {
 	switch {
 	case dbType == "NUMBER":
 		precision, scale, ok := ct.DecimalSize()
-		if ok && scale == 0 && precision > 0 && precision <= 18 {
-			return arrow.PrimitiveTypes.Int64
-		}
-		if ok && scale == 0 && precision > 18 {
-			return arrow.BinaryTypes.String
-		}
-		return arrow.PrimitiveTypes.Float64
+		return numberToArrow(precision, scale, ok, numberMapping)
 	case dbType == "FLOAT" || dbType == "BINARY_FLOAT" || dbType == "BINARY_DOUBLE" ||
 		dbType == "IBFLOAT" || dbType == "IBDOUBLE" || // TNS names for BINARY_FLOAT/DOUBLE
 		dbType == "BFLOAT" || dbType == "BDOUBLE":
@@ -1745,4 +1761,58 @@ func oracleTypeToArrow(ct *sql.ColumnType) arrow.DataType {
 	default:
 		return arrow.BinaryTypes.String
 	}
+}
+
+// numberToArrow picks the Arrow type for an Oracle NUMBER column under the
+// configured mapping policy. precision, scale and ok are as reported by
+// sql.ColumnType.DecimalSize. See the NumberMapping* constants.
+func numberToArrow(precision, scale int64, ok bool, numberMapping string) arrow.DataType {
+	if numberMapping == NumberMappingString {
+		return arrow.BinaryTypes.String
+	}
+
+	// Integral NUMBER narrow enough for int64 is exact under every policy, and
+	// cheaper than a decimal, so it wins before the policies diverge.
+	if ok && scale == 0 && precision > 0 && precision <= 18 {
+		return arrow.PrimitiveTypes.Int64
+	}
+
+	if numberMapping == NumberMappingDecimal {
+		if dt := numberDecimalType(precision, scale, ok); dt != nil {
+			return dt
+		}
+		// Not representable as Decimal128 — unconstrained NUMBER, a negative
+		// declared scale, or precision beyond 38. Prefer the lossless String
+		// over silently truncating into a float.
+		return arrow.BinaryTypes.String
+	}
+
+	// NumberMappingFloat (the default) — historical behaviour.
+	if ok && scale == 0 && precision > 18 {
+		return arrow.BinaryTypes.String
+	}
+	return arrow.PrimitiveTypes.Float64
+}
+
+// numberDecimalType returns the Decimal128 type for a declared precision and
+// scale, or nil when the pair cannot be represented exactly.
+func numberDecimalType(precision, scale int64, ok bool) arrow.DataType {
+	if !ok {
+		return nil
+	}
+	if scale == oracleScaleSentinel {
+		// Unconstrained NUMBER: no declared scale to build a decimal from.
+		return nil
+	}
+	if precision < 1 || precision > maxDecimal128Precision {
+		return nil
+	}
+	// scale > precision is legal in Arrow but not in Parquet, and does not
+	// arise from a real Oracle column; reject it rather than emit a decimal
+	// that fails to serialise downstream. Every wrapped negative scale
+	// (256+scale, so >= 172) is excluded by the same bound.
+	if scale < 0 || scale > precision {
+		return nil
+	}
+	return &arrow.Decimal128Type{Precision: int32(precision), Scale: int32(scale)}
 }

@@ -35,6 +35,8 @@ func appendValue(fieldBuilder array.Builder, val interface{}, ct *sql.ColumnType
 		return appendInt64(b, val)
 	case *array.Float64Builder:
 		return appendFloat64(b, val)
+	case *array.Decimal128Builder:
+		return appendDecimal128(b, val)
 	case *array.StringBuilder:
 		return appendString(b, val)
 	case *array.TimestampBuilder:
@@ -109,6 +111,35 @@ func appendFloat64(b *array.Float64Builder, val interface{}) int64 {
 		b.AppendNull()
 	}
 	return 8
+}
+
+// appendDecimal128 preserves Oracle NUMBER precision. go-ora decodes NUMBER to
+// a full-precision decimal string (parameter.go: `num.String()`), so the string
+// case is the one that actually runs for a NUMBER column; the numeric cases
+// cover values reaching this builder by another route.
+//
+// AppendValueFromString appends a null itself when parsing fails, so failures
+// must not append again.
+func appendDecimal128(b *array.Decimal128Builder, val interface{}) int64 {
+	switch v := val.(type) {
+	case string:
+		_ = b.AppendValueFromString(v)
+	case []byte:
+		_ = b.AppendValueFromString(string(v))
+	case int64:
+		_ = b.AppendValueFromString(strconv.FormatInt(v, 10))
+	case int32:
+		_ = b.AppendValueFromString(strconv.FormatInt(int64(v), 10))
+	case int:
+		_ = b.AppendValueFromString(strconv.FormatInt(int64(v), 10))
+	case float64:
+		_ = b.AppendValueFromString(strconv.FormatFloat(v, 'f', -1, 64))
+	case float32:
+		_ = b.AppendValueFromString(strconv.FormatFloat(float64(v), 'f', -1, 32))
+	default:
+		b.AppendNull()
+	}
+	return 16
 }
 
 func appendString(b *array.StringBuilder, val interface{}) int64 {
