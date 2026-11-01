@@ -16,12 +16,14 @@ package oracle
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -490,4 +492,127 @@ func TestGetParameterSchemaIsNotImplemented(t *testing.T) {
 	if adbcErr.Code != adbc.StatusNotImplemented {
 		t.Errorf("status = %v, want StatusNotImplemented", adbcErr.Code)
 	}
+}
+
+// lobColumnsOfTable must report which destination columns are character LOBs.
+// It read go-ora's wire type names, which do not survive a result set
+// faithfully: a CLOB comes back as LongVarChar, a VARCHAR2 as NCHAR, an NCHAR
+// as CHAR. So it answered "no LOBs" for every table, including one that is all
+// CLOB, which is what this pins.
+//
+// No end-to-end failure is asserted because there is not one to assert: a
+// plain string array bind into a CLOB column works at any width tried, up to
+// 1 MiB, so the wrong answer is currently harmless. It is still the wrong
+// answer, and the only thing standing between it and a real failure is a bind
+// limit that go-ora documents but does not appear to enforce.
+func TestIntegration_LobColumnsOfTableReadsDeclaredTypes(t *testing.T) {
+	dsn := getTestDSN(t)
+	ctx := context.Background()
+
+	drv := NewDriver(memory.DefaultAllocator)
+	db, err := drv.NewDatabase(map[string]string{OptionDSN: dsn})
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+
+	cnxn, err := db.Open(ctx)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cnxn.Close()
+
+	const table = "ADBC_T30_LOBCOLS"
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+
+		` ("ID" NUMBER(19), "TXT" VARCHAR2(10), "DOC" CLOB, "NDOC" NCLOB, "BIN" BLOB)`)
+	defer dropTable(ctx, t, cnxn, table)
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "txt", Type: arrow.BinaryTypes.String},
+		{Name: "doc", Type: arrow.BinaryTypes.String},
+		{Name: "ndoc", Type: arrow.BinaryTypes.String},
+		{Name: "bin", Type: arrow.BinaryTypes.Binary},
+	}, nil)
+
+	// Reach the implementation directly: the public path only consults the
+	// dictionary in append and create-append modes, and the answer is what
+	// matters here, not the ingest that follows it.
+	s := &statementImpl{cnxn: newDirectConnection(t, dsn)}
+
+	got, err := s.lobColumnsOfTable(ctx, table, schema)
+	if err != nil {
+		t.Fatalf("lobColumnsOfTable: %v", err)
+	}
+	want := []bool{false, false, true, true, false}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("column %q: got %v, want %v (full: %v)",
+				schema.Field(i).Name, got[i], want[i], got)
+		}
+	}
+
+	// A schema-qualified name must resolve the same way.
+	qualified, err := s.lobColumnsOfTable(ctx,
+		strings.ToUpper(querySingleString(ctx, t, cnxn, currentSchemaSQL))+"."+table, schema)
+	if err != nil {
+		t.Fatalf("lobColumnsOfTable(qualified): %v", err)
+	}
+	for i := range want {
+		if qualified[i] != want[i] {
+			t.Errorf("qualified column %q: got %v, want %v", schema.Field(i).Name, qualified[i], want[i])
+		}
+	}
+
+	// An unknown table has to report an error so resolveStringBinds falls
+	// back rather than treating "no columns" as "no LOBs".
+	if _, err := s.lobColumnsOfTable(ctx, "ADBC_T30_NO_SUCH_TABLE", schema); err == nil {
+		t.Error("unknown table returned no error; the caller cannot tell it apart from a table with no LOBs")
+	}
+}
+
+func TestSplitQualifiedName(t *testing.T) {
+	cases := []struct{ in, owner, table string }{
+		{"T", "", "T"},
+		{"HR.T", "HR", "T"},
+		{`"HR"."T"`, "HR", "T"},
+		{"  HR.T  ", "HR", "T"},
+		{`"T"`, "", "T"},
+	}
+	for _, tc := range cases {
+		owner, table := splitQualifiedName(tc.in)
+		if owner != tc.owner || table != tc.table {
+			t.Errorf("splitQualifiedName(%q) = (%q, %q), want (%q, %q)",
+				tc.in, owner, table, tc.owner, tc.table)
+		}
+	}
+}
+
+// newDirectConnection builds a connectionImpl against a real database, wired
+// the way databaseImpl.Open wires one. Lets a test call an unexported method
+// without reaching through driverbase's wrapper.
+func newDirectConnection(t *testing.T, dsn string) *connectionImpl {
+	t.Helper()
+	pool, err := sql.Open("oracle", dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	conn, err := pool.Conn(context.Background())
+	if err != nil {
+		pool.Close()
+		t.Fatalf("checkout session: %v", err)
+	}
+	c := &connectionImpl{db: pool, conn: conn}
+	c.ErrorHelper = driverbase.ErrorHelper{DriverName: "Oracle"}
+	c.Autocommit = true
+	c.txCtx, c.txCancel = context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		c.Close()
+		pool.Close()
+	})
+	return c
 }

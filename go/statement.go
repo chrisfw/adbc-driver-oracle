@@ -1253,32 +1253,46 @@ func isClobDDLType(ddl string) bool {
 	return false
 }
 
-// lobColumnsOfTable asks the server which of the target table's columns are
-// character LOBs, matched by name to the bound schema.
+// lobColumnsOfTable asks the data dictionary which of the target table's
+// columns are character LOBs, matched by name to the bound schema.
 //
-// The table is described with a no-row SELECT rather than ALL_TAB_COLUMNS:
-// tableName is whatever the INSERT already uses, so this needs no owner
-// resolution or identifier parsing to agree with it. It does need SELECT on
-// the table, which an INSERT-only grant would not include; that failure is the
-// caller's cue to fall back.
+// ALL_TAB_COLUMNS, not a no-row SELECT on the table: go-ora's wire type names
+// do not survive that round trip reliably. A CLOB comes back as LongVarChar, a
+// VARCHAR2 as NCHAR and an NCHAR as CHAR, so a decision made on them reads a
+// CLOB column as plain text and binds strings into it, which then fails on the
+// first wide value. DATA_TYPE is the declared type and says CLOB.
 func (s *statementImpl) lobColumnsOfTable(ctx context.Context, tableName string, schema *arrow.Schema) ([]bool, error) {
 	sess, err := s.cnxn.session(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := sess.QueryContext(ctx, "SELECT * FROM "+tableName+" WHERE 1 = 0")
+
+	owner, table := splitQualifiedName(tableName)
+	const query = `SELECT COLUMN_NAME, DATA_TYPE FROM ALL_TAB_COLUMNS
+		WHERE OWNER = NVL(:1, SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AND TABLE_NAME = :2`
+	var ownerArg interface{}
+	if owner != "" {
+		ownerArg = owner
+	}
+	rows, err := sess.QueryContext(ctx, query, ownerArg, table)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	colTypes, err := rows.ColumnTypes()
-	if err != nil {
+	lob := make(map[string]bool)
+	for rows.Next() {
+		var name, dataType string
+		if err := rows.Scan(&name, &dataType); err != nil {
+			return nil, err
+		}
+		lob[strings.ToUpper(name)] = isClobDDLType(dataType)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	lob := make(map[string]bool, len(colTypes))
-	for _, ct := range colTypes {
-		lob[strings.ToUpper(ct.Name())] = isClobColumnTypeName(ct.DatabaseTypeName())
+	if len(lob) == 0 {
+		return nil, fmt.Errorf("no columns found for %s", tableName)
 	}
 
 	binds := make([]bool, schema.NumFields())
@@ -1288,15 +1302,15 @@ func (s *statementImpl) lobColumnsOfTable(ctx context.Context, tableName string,
 	return binds, nil
 }
 
-// isClobColumnTypeName reports whether a column type name from a result set
-// denotes a character LOB. go-ora reports TNS wire names (OCIClobLocator)
-// alongside the DDL names, the same split oracleTypeToArrow handles.
-func isClobColumnTypeName(name string) bool {
-	switch strings.ToUpper(name) {
-	case "CLOB", "NCLOB", "OCICLOBLOCATOR":
-		return true
+// splitQualifiedName separates an optional SCHEMA. prefix from a table name.
+// Returns an empty owner for an unqualified name, which the caller resolves to
+// the session's current schema.
+func splitQualifiedName(name string) (owner, table string) {
+	name = strings.TrimSpace(name)
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		return strings.Trim(name[:i], `"`), strings.Trim(name[i+1:], `"`)
 	}
-	return false
+	return "", strings.Trim(name, `"`)
 }
 
 // intColumnToSlice converts any fixed-width integer Arrow array to NullInt64s.
