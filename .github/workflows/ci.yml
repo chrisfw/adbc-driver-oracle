@@ -6,28 +6,212 @@ on:
   pull_request:
     branches: [main]
 
+# Everything here runs on standard GitHub-hosted runners, which are free with
+# unlimited minutes on a public repository. Larger runners are billed even on
+# public repos, so do not move these to one without deciding to pay for it.
+
 jobs:
   test:
-    name: Test
+    name: Unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          # Read the version from go.mod rather than pinning one here. A pinned
+          # 1.23 against a go.mod requiring 1.26 is why this workflow could not
+          # build at all.
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
 
       - name: Unit tests
-        run: go test -v ./go/...
+        run: go test -race ./go/...
 
       - name: Build driver package
-        run: go build ./go/
+        run: go build ./...
 
       - name: Build CLI
         run: go build -o oracle-adbc-test ./cmd/main.go
 
-      - name: Vet
-        run: go vet ./go/...
+  integration-test:
+    name: Integration tests (Oracle Free 23ai)
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      oracle:
+        # The non-slim image on purpose: the slim variants omit Oracle Spatial,
+        # so MDSYS.SDO_GEOMETRY does not exist and every geometry test fails
+        # with ORA-00902.
+        image: gvenzl/oracle-free:23-faststart
+        env:
+          # Literals, not ${{ env.* }}: the env context is not available to
+          # jobs.<id>.services, so an expression here evaluates to empty, the
+          # image generates a random SYS password and never creates the app
+          # user. These are throwaway credentials for a container that lives
+          # for one job.
+          ORACLE_PASSWORD: ci_sys_pw_1
+          APP_USER: adbc
+          APP_USER_PASSWORD: ci_app_pw_1
+        ports:
+          - 1521:1521
+        options: >-
+          --shm-size=1g
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 60
+
+    env:
+      ORACLE_SYS_PASSWORD: ci_sys_pw_1
+      ORACLE_APP_USER: adbc
+      ORACLE_APP_PASSWORD: ci_app_pw_1
+      ORACLE_TEST_DSN: oracle://adbc:ci_app_pw_1@localhost:1521/FREEPDB1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Raise the process limit
+        # A fresh Oracle Free container allows 200 processes, and the suite
+        # exhausts that: connections accumulate across several hundred tests
+        # faster than Oracle reclaims them, and the run dies partway with
+        # ORA-00020 surfacing as "failed to ping Oracle: EOF".
+        #
+        # processes is not dynamic, so SCOPE=SPFILE alone does nothing for the
+        # running instance and the database has to be bounced for it to apply.
+        # That costs about half a minute on a throwaway container.
+        run: |
+          docker exec -i ${{ job.services.oracle.id }} \
+            sqlplus -S / as sysdba <<'SQL'
+          WHENEVER SQLERROR EXIT 1
+          ALTER SYSTEM SET processes=400 SCOPE=SPFILE;
+          SHUTDOWN IMMEDIATE;
+          STARTUP;
+          -- STARTUP usually opens the pluggable database already, and
+          -- reopening it raises ORA-65019, so this one error is tolerated
+          -- rather than failing the step.
+          WHENEVER SQLERROR CONTINUE
+          ALTER PLUGGABLE DATABASE ALL OPEN;
+          EXIT
+          SQL
+
+      - name: Wait for the database to come back
+        run: |
+          for i in $(seq 1 60); do
+            if docker exec -i ${{ job.services.oracle.id }} \
+                 sqlplus -S -L system/ci_sys_pw_1@localhost:1521/FREEPDB1 \
+                 <<< $'SET HEADING OFF FEEDBACK OFF\nSELECT 1 FROM dual;\nEXIT' 2>/dev/null \
+                 | grep -q '^\s*1'; then
+              echo "database is back after ~$((i * 2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::The database did not come back after the restart."
+          exit 1
+
+      - name: Grant test privileges and create the second schema
+        # The image creates APP_USER with CREATE SESSION, CREATE TABLE and a
+        # tablespace quota. The suite needs more than that, and several tests
+        # skip rather than fail when a privilege is missing, which would make
+        # this job pass while covering nothing. Granting it all up front is
+        # what makes the run meaningful.
+        #
+        # sqlplus comes from the image, so no Oracle client is needed on the
+        # runner. job.services.oracle.id is the container to exec into.
+        run: |
+          docker exec -i ${{ job.services.oracle.id }} \
+            sqlplus -S / as sysdba <<'SQL'
+          WHENEVER SQLERROR EXIT 1
+          ALTER SESSION SET CONTAINER = FREEPDB1;
+
+          -- ALTER SESSION is required, not optional: the session-ownership and
+          -- schema-quoting tests fail without it rather than skipping.
+          GRANT CREATE SESSION, ALTER SESSION, CREATE TABLE, CREATE VIEW,
+                CREATE PROCEDURE, UNLIMITED TABLESPACE TO ${{ env.ORACLE_APP_USER }};
+
+          -- Lets the cross-schema test provision its own fixture instead of
+          -- skipping.
+          GRANT CREATE ANY TABLE, DROP ANY TABLE, SELECT ANY TABLE,
+                INSERT ANY TABLE TO ${{ env.ORACLE_APP_USER }};
+
+          -- v_$parameter drives MAX_STRING_SIZE detection, v_$sql lets the
+          -- bound-batch test count server-side executions. Both degrade to a
+          -- skip without the grant, so they are granted to keep coverage.
+          GRANT SELECT ON sys.v_$parameter TO ${{ env.ORACLE_APP_USER }};
+          GRANT SELECT ON sys.v_$sql TO ${{ env.ORACLE_APP_USER }};
+
+          -- The schema-redirection test needs a second schema holding a table
+          -- that exists only there.
+          DECLARE
+            already EXCEPTION;
+            PRAGMA EXCEPTION_INIT(already, -1920);
+          BEGIN
+            EXECUTE IMMEDIATE 'CREATE USER ADBC_OTHER IDENTIFIED BY ci_other_pw_1 QUOTA UNLIMITED ON USERS';
+          EXCEPTION WHEN already THEN NULL;
+          END;
+          /
+          GRANT CREATE SESSION, CREATE TABLE TO ADBC_OTHER;
+
+          EXIT
+          SQL
+
+      - name: Confirm Spatial is present
+        # A slim image, or a Spatial-less build, would turn every geometry test
+        # into a failure far from its cause. Fail here instead, with the reason.
+        run: |
+          docker exec -i ${{ job.services.oracle.id }} \
+            sqlplus -S -L ${{ env.ORACLE_APP_USER }}/${{ env.ORACLE_APP_PASSWORD }}@localhost:1521/FREEPDB1 <<'SQL' | tee /tmp/spatial.txt
+          SET HEADING OFF FEEDBACK OFF
+          SELECT 'SDO_GEOMETRY_TYPES=' || COUNT(*) FROM all_objects
+            WHERE owner = 'MDSYS' AND object_name = 'SDO_GEOMETRY';
+          EXIT
+          SQL
+          if ! grep -q 'SDO_GEOMETRY_TYPES=[1-9]' /tmp/spatial.txt; then
+            echo "::error::MDSYS.SDO_GEOMETRY is missing. The image must include Oracle Spatial (use the non-slim gvenzl/oracle-free tag)."
+            exit 1
+          fi
+
+      - name: Integration tests
+        # -race as the remediation plan requires. The whole suite runs, not
+        # just TestIntegration: the benchmark and fixture tests also need the
+        # database, and restricting the pattern would quietly drop them.
+        #
+        # -v is load-bearing, not noise. go test prints neither "--- SKIP"
+        # lines nor skip messages without it, so the two guards below would
+        # find nothing to match and pass on a run where every database test
+        # had skipped itself.
+        run: set -o pipefail; go test -race -v -timeout 20m ./go/... 2>&1 | tee /tmp/test.log
+
+      - name: Fail if the database was not actually reachable
+        # Every database-backed test skips itself when ORACLE_TEST_DSN is
+        # unset. That is right for a laptop and wrong for CI, where it would
+        # turn a broken service container into a green run covering nothing.
+        run: |
+          if grep -q 'ORACLE_TEST_DSN not set' /tmp/test.log; then
+            echo "::error::Integration tests skipped themselves, so the Oracle service container was not reachable."
+            exit 1
+          fi
+
+      - name: Report skipped tests
+        # Skips are legitimate here (a missing fixture file, for instance) but
+        # they should be visible rather than buried, or coverage can erode
+        # without anyone noticing.
+        if: always()
+        run: |
+          if grep -qE '^\s*--- SKIP' /tmp/test.log; then
+            echo "### Skipped tests" >> "$GITHUB_STEP_SUMMARY"
+            grep -E '^\s*--- SKIP' /tmp/test.log | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No tests were skipped." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   build-shared-library:
     name: Build ${{ matrix.name }}
@@ -59,7 +243,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
 
       - name: Install cross-compiler
         if: matrix.cross_pkg
@@ -81,21 +265,7 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
-
-  integration-test:
-    name: Integration tests
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-
-      - name: Integration tests
-        if: env.ORACLE_TEST_DSN != ''
-        env:
-          ORACLE_TEST_DSN: ${{ secrets.ORACLE_TEST_DSN }}
-        run: go test -v -run TestIntegration ./go/...
+          # Artifact storage counts against the account quota even on public
+          # repos, so these expire rather than accumulating. The release
+          # workflow is what publishes anything meant to last.
+          retention-days: 7
