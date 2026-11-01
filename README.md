@@ -69,6 +69,25 @@ reader, _, _ := stmt.ExecuteQuery(ctx)
 // reader is an Arrow RecordReader with geoarrow.wkb geometry columns
 ```
 
+## Connections and sessions
+
+Each ADBC connection owns one Oracle session for its whole life, checked out of
+the database's pool by `db.Open` and handed back by `cnxn.Close`. That is what
+makes session state mean anything: `ALTER SESSION`, `CURRENT_SCHEMA`, temporary
+tables and transactions all belong to the connection that set them and are
+invisible to every other connection.
+
+`oracle.pool_size` (default 8) therefore bounds concurrent connections plus the
+extra sessions ingest workers borrow, roughly `connections * (1 +
+oracle.ingest_workers)`.
+
+Bulk ingest is the one place a connection uses more than its own session, and
+only when autocommit is on: each worker inserts and commits on a session of its
+own, which is what overlaps round-trip latency on remote listeners. With
+autocommit off the rows must land in the caller's transaction, so ingest runs
+serially on the connection's own session and the caller's `Commit` decides the
+outcome.
+
 ## Supported Oracle Types
 
 | Oracle Type | Arrow Type | Notes |

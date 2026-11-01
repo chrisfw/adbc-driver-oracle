@@ -153,7 +153,7 @@ func (s *statementImpl) Prepare(ctx context.Context) error {
 		return s.ErrorHelper.Errorf(adbc.StatusInvalidState, "no query set")
 	}
 	s.closePrepared()
-	stmt, err := s.cnxn.db.PrepareContext(ctx, s.query)
+	stmt, err := s.cnxn.session().PrepareContext(ctx, s.query)
 	if err != nil {
 		return s.ErrorHelper.Errorf(adbc.StatusIO, "prepare failed: %s", err)
 	}
@@ -196,7 +196,7 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 	if s.prepared != nil {
 		rows, err = s.prepared.QueryContext(ctx, args...)
 	} else {
-		rows, err = s.cnxn.db.QueryContext(ctx, s.query, args...)
+		rows, err = s.cnxn.session().QueryContext(ctx, s.query, args...)
 	}
 	if err != nil {
 		return nil, -1, s.ErrorHelper.Errorf(adbc.StatusIO, "query execution failed: %s", err)
@@ -235,7 +235,7 @@ func (s *statementImpl) ExecuteUpdate(ctx context.Context) (int64, error) {
 		if s.prepared != nil {
 			result, err = s.prepared.ExecContext(ctx, args...)
 		} else {
-			result, err = s.cnxn.db.ExecContext(ctx, s.query, args...)
+			result, err = s.cnxn.session().ExecContext(ctx, s.query, args...)
 		}
 		if err != nil {
 			return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "execute failed: %s", err)
@@ -458,9 +458,9 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	// Note: APPEND_VALUES hint is not compatible with go-ora's array binding protocol
 	// (Oracle interprets al8i4[1]>1 as batch execution, triggering ORA-38910).
 	// NOLOGGING alone still reduces redo I/O for conventional inserts.
-	s.cnxn.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s NOLOGGING", tableName))
+	s.cnxn.session().ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s NOLOGGING", tableName))
 	// Restore logging on every exit path, not just success.
-	defer s.cnxn.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s LOGGING", tableName))
+	defer s.cnxn.session().ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s LOGGING", tableName))
 
 	var totalRows int64
 
@@ -597,6 +597,9 @@ func (s *statementImpl) insertBatchParallel(ctx context.Context, insertSQL strin
 	if w := os.Getenv("ORACLE_INGEST_WORKERS"); w != "" {
 		fmt.Sscanf(w, "%d", &numWorkers)
 	}
+	// Autocommit off forces this to 1: the rows must stay inside the caller's
+	// transaction, which only the connection's owned session is in.
+	numWorkers = s.cnxn.ingestConcurrency(numWorkers)
 	chunkSize := (numRows + numWorkers - 1) / numWorkers
 	if chunkSize < 500 || numWorkers <= 1 {
 		// For small batches, just use single connection
@@ -646,22 +649,20 @@ func (s *statementImpl) insertBatchParallel(ctx context.Context, insertSQL strin
 }
 
 // insertChunk inserts a slice of rows [startRow, endRow) from a record batch.
-// Uses a fresh connection from the pool to enable parallel inserts and avoid
-// Oracle ORA-00600 errors from long-running UDT sessions.
+// The session comes from newIngestSession: a fresh pooled one under autocommit
+// (parallel inserts, and it avoids the ORA-00600 that long-running UDT sessions
+// hit), or the connection's owned session when a caller transaction is in play.
 func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec arrow.RecordBatch, startRow, endRow int) (int64, error) {
 	numRows := endRow - startRow
 	numCols := int(rec.NumCols())
 
-	// Each goroutine gets its own connection from the pool.
-	// This also works around Oracle ORA-00600 kopi2_readlen083 bugs
-	// that occur after inserting many SDO_GEOMETRY UDTs on a single session.
-	conn, err := s.cnxn.db.Conn(ctx)
+	sess, err := s.cnxn.newIngestSession(ctx)
 	if err != nil {
 		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "get connection failed: %s", err)
 	}
-	defer conn.Close()
+	defer sess.close()
 
-	stmt, err := conn.PrepareContext(ctx, insertSQL)
+	stmt, err := sess.exec.PrepareContext(ctx, insertSQL)
 	if err != nil {
 		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "prepare insert failed: %s", err)
 	}
@@ -684,7 +685,7 @@ func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec a
 		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
 	}
 
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+	if err := sess.commit(ctx); err != nil {
 		return int64(numRows), s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
 	}
 
@@ -713,7 +714,8 @@ func (s *statementImpl) streamWorkerCount() int {
 	if n <= 0 {
 		n = 4
 	}
-	return n
+	// Autocommit off forces this to 1, see ingestConcurrency.
+	return s.cnxn.ingestConcurrency(n)
 }
 
 // Stream-consumer tuning. Commits are batched (an Oracle round trip each) and
@@ -726,13 +728,17 @@ const (
 	streamRecycleBatches     = 64
 )
 
-// streamInsertWorker drains prepared batches from `in` over its own pooled
-// connection: prepare once per session, exec per batch, COMMIT every
+// streamInsertWorker drains prepared batches from `in` over one ingest
+// session: prepare once per session, exec per batch, COMMIT every
 // streamCommitEveryBatches, recycle the session every streamRecycleBatches.
-// Returns the rows successfully inserted AND committed.
+//
+// Returns the rows durably written by this worker. Under autocommit that means
+// inserted and committed on its own pooled session. With autocommit off the
+// session is the connection's own, commit is a no-op here, and the count is
+// the rows added to the caller's transaction for the caller's Commit to keep.
 func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string, in <-chan preparedBatchT, done <-chan struct{}) (int64, error) {
 	var (
-		conn         *sql.Conn
+		sess         *ingestSession
 		stmt         *sql.Stmt
 		committed    int64
 		uncommitted  int64
@@ -744,19 +750,19 @@ func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string
 			stmt.Close()
 			stmt = nil
 		}
-		if conn != nil {
-			conn.Close()
-			conn = nil
+		if sess != nil {
+			sess.close()
+			sess = nil
 		}
 	}
 	defer cleanup()
 
 	open := func() error {
 		var err error
-		if conn, err = s.cnxn.db.Conn(ctx); err != nil {
+		if sess, err = s.cnxn.newIngestSession(ctx); err != nil {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "get connection failed: %s", err)
 		}
-		if stmt, err = conn.PrepareContext(ctx, insertSQL); err != nil {
+		if stmt, err = sess.exec.PrepareContext(ctx, insertSQL); err != nil {
 			cleanup()
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "prepare insert failed: %s", err)
 		}
@@ -764,10 +770,10 @@ func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string
 		return nil
 	}
 	commit := func() error {
-		if conn == nil || uncommitted == 0 {
+		if sess == nil || uncommitted == 0 {
 			return nil
 		}
-		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		if err := sess.commit(ctx); err != nil {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
 		}
 		committed += uncommitted
@@ -793,7 +799,7 @@ func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string
 			err := commit()
 			return committed, err
 		}
-		if conn == nil {
+		if sess == nil {
 			if err := open(); err != nil {
 				return committed, err
 			}
@@ -819,7 +825,11 @@ func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string
 				return committed, err
 			}
 		}
-		if sinceRecycle >= streamRecycleBatches {
+		if sinceRecycle >= streamRecycleBatches && sess.pooled {
+			// Recycling is only meaningful for a pooled session: a *fresh*
+			// session is what dodges go-ora's ORA-00600 after many UDT binds.
+			// The owned session cannot be swapped without leaving the caller's
+			// transaction, so autocommit-off ingest keeps the one session.
 			if err := commit(); err != nil {
 				return committed, err
 			}
@@ -829,13 +839,13 @@ func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string
 }
 
 func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL string, args []interface{}, numRows int) (int64, error) {
-	conn, err := s.cnxn.db.Conn(ctx)
+	sess, err := s.cnxn.newIngestSession(ctx)
 	if err != nil {
 		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "get connection failed: %s", err)
 	}
-	defer conn.Close()
+	defer sess.close()
 
-	stmt, err := conn.PrepareContext(ctx, insertSQL)
+	stmt, err := sess.exec.PrepareContext(ctx, insertSQL)
 	if err != nil {
 		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "prepare insert failed: %s", err)
 	}
@@ -854,7 +864,7 @@ func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL strin
 		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
 	}
 
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+	if err := sess.commit(ctx); err != nil {
 		return int64(numRows), s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
 	}
 
@@ -1124,7 +1134,7 @@ func (s *statementImpl) prepareIngestTable(ctx context.Context, tableName string
 	case adbc.OptionValueIngestModeCreate:
 		// Create table — fail if exists
 		ddl := buildCreateTableDDL(tableName, schema, colTypes)
-		if _, err := s.cnxn.db.ExecContext(ctx, ddl); err != nil {
+		if _, err := s.cnxn.session().ExecContext(ctx, ddl); err != nil {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
 		}
 	case adbc.OptionValueIngestModeAppend:
@@ -1133,18 +1143,18 @@ func (s *statementImpl) prepareIngestTable(ctx context.Context, tableName string
 		// Drop and recreate. A missing table (ORA-00942) is fine; any other
 		// drop failure would surface as a confusing ORA-00955 on the CREATE,
 		// so report it directly.
-		if _, err := s.cnxn.db.ExecContext(ctx, fmt.Sprintf("DROP TABLE %s PURGE", tableName)); err != nil && !isOraCode(err, 942) {
+		if _, err := s.cnxn.session().ExecContext(ctx, fmt.Sprintf("DROP TABLE %s PURGE", tableName)); err != nil && !isOraCode(err, 942) {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "drop table failed: %s", err)
 		}
 		ddl := buildCreateTableDDL(tableName, schema, colTypes)
-		if _, err := s.cnxn.db.ExecContext(ctx, ddl); err != nil {
+		if _, err := s.cnxn.session().ExecContext(ctx, ddl); err != nil {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
 		}
 	case adbc.OptionValueIngestModeCreateAppend:
 		// Create if not exists, append if exists. Only ORA-00955 ("name is
 		// already used") means "exists" — anything else is a real failure.
 		ddl := buildCreateTableDDL(tableName, schema, colTypes)
-		if _, err := s.cnxn.db.ExecContext(ctx, ddl); err != nil && !isOraCode(err, 955) {
+		if _, err := s.cnxn.session().ExecContext(ctx, ddl); err != nil && !isOraCode(err, 955) {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
 		}
 	default:

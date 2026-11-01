@@ -27,9 +27,20 @@ import (
 
 type connectionImpl struct {
 	driverbase.ConnectionImplBase
-	db            *sql.DB
-	ownsDB        bool // if true, Close() closes the db; if false, pool is shared
-	ingestWorkers int  // parallel insert workers (from database config)
+
+	// db is the database's shared pool, kept only as a session factory for
+	// ingest workers. Statements must never run on it: a pool hands out
+	// whichever session is free, so a query, an ALTER SESSION and a COMMIT
+	// issued back to back could each land on a different Oracle session.
+	db *sql.DB
+
+	// conn is this ADBC connection's own Oracle session, checked out of the
+	// pool for the connection's whole life. Every statement, session setting
+	// and transaction runs here, which is what makes ALTER SESSION,
+	// CURRENT_SCHEMA and transactions mean anything on this connection.
+	conn *sql.Conn
+
+	ingestWorkers int // parallel insert workers (from database config)
 
 	// numberMapping is the NUMBER→Arrow policy for result sets, resolved to a
 	// concrete value by databaseImpl.effectiveNumberMapping.
@@ -37,6 +48,93 @@ type connectionImpl struct {
 
 	varcharOnce  sync.Once
 	varcharLimit int // cached inline VARCHAR2 byte cap; see inlineStringLimit
+}
+
+// sessionExecutor is the subset of *sql.Conn and *sql.Tx that statements and
+// metadata queries use. Both types satisfy it, so routing this connection's
+// work through an open transaction becomes a change to session() alone rather
+// than to every call site.
+type sessionExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
+}
+
+// session returns the executor this connection's work runs on: its owned
+// Oracle session.
+//
+// After Close the returned *sql.Conn is spent rather than nil, so a statement
+// used past its connection reports sql.ErrConnDone instead of panicking.
+func (c *connectionImpl) session() sessionExecutor {
+	return c.conn
+}
+
+// ingestSession is the session one ingest worker inserts on.
+//
+// With autocommit on, each worker takes its own pooled session: ingest batches
+// commit themselves and are order-independent, nothing is inside a caller
+// transaction, and the round-trip latency of one worker overlaps another's.
+// Recycling such a session also sidesteps the ORA-00600 [kopi2_readlen083]
+// that go-ora hits after many SDO_GEOMETRY UDT binds on one session.
+//
+// With autocommit off the rows have to land in the caller's transaction, and
+// only the connection's owned session is in that transaction. Workers then
+// share that one session, committing is the caller's job, and closing is a
+// no-op because the session outlives the ingest.
+type ingestSession struct {
+	exec sessionExecutor
+
+	// pooled distinguishes a session taken from the pool for this worker
+	// alone, which is safe to COMMIT on and to close, from the connection's
+	// owned session, which is neither.
+	pooled bool
+	conn   *sql.Conn
+}
+
+func (c *connectionImpl) newIngestSession(ctx context.Context) (*ingestSession, error) {
+	if !c.Autocommit {
+		return &ingestSession{exec: c.session()}, nil
+	}
+	conn, err := c.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &ingestSession{exec: conn, pooled: true, conn: conn}, nil
+}
+
+// commit ends this worker's unit of work. Only a pooled session commits; on
+// the owned session the caller's Commit decides the fate of the whole ingest.
+func (is *ingestSession) commit(ctx context.Context) error {
+	if !is.pooled {
+		return nil
+	}
+	_, err := is.conn.ExecContext(ctx, "COMMIT")
+	return err
+}
+
+// close returns a pooled session to the pool. The owned session outlives the
+// ingest, so closing it here would take the whole ADBC connection down.
+func (is *ingestSession) close() {
+	if is.pooled && is.conn != nil {
+		is.conn.Close()
+		is.conn = nil
+		is.exec = nil
+	}
+}
+
+// ingestConcurrency caps ingest parallelism at what the current transaction
+// mode allows. With autocommit off every worker shares the connection's single
+// owned session so the rows stay inside the caller's transaction; parallel
+// workers would only interleave on that one session, so ingest goes serial.
+func (c *connectionImpl) ingestConcurrency(requested int) int {
+	if !c.Autocommit {
+		return 1
+	}
+	if requested < 1 {
+		return 1
+	}
+	return requested
 }
 
 // inlineStringLimit is the max byte length a value can carry as a plain
@@ -56,7 +154,7 @@ func (c *connectionImpl) inlineStringLimit(ctx context.Context) int {
 	c.varcharOnce.Do(func() {
 		c.varcharLimit = maxInlineStringBytes
 		var v string
-		if err := c.db.QueryRowContext(ctx,
+		if err := c.session().QueryRowContext(ctx,
 			"SELECT value FROM v$parameter WHERE name = 'max_string_size'").Scan(&v); err == nil {
 			if strings.EqualFold(strings.TrimSpace(v), "EXTENDED") {
 				c.varcharLimit = maxExtendedStringBytes
@@ -81,7 +179,7 @@ func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
 func (c *connectionImpl) GetCatalogs(ctx context.Context, catalogFilter *string) ([]string, error) {
 	// Oracle doesn't have catalogs in the same way. Return the current database name.
 	var name string
-	err := c.db.QueryRowContext(ctx, "SELECT ORA_DATABASE_NAME FROM DUAL").Scan(&name)
+	err := c.session().QueryRowContext(ctx, "SELECT ORA_DATABASE_NAME FROM DUAL").Scan(&name)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +191,7 @@ func (c *connectionImpl) GetCatalogs(ctx context.Context, catalogFilter *string)
 
 func (c *connectionImpl) GetDBSchemasForCatalog(ctx context.Context, catalog string, schemaFilter *string) ([]string, error) {
 	query := "SELECT USERNAME FROM ALL_USERS ORDER BY USERNAME"
-	rows, err := c.db.QueryContext(ctx, query)
+	rows, err := c.session().QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +218,7 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 		SELECT VIEW_NAME, 'VIEW' AS TABLE_TYPE FROM ALL_VIEWS WHERE OWNER = :2
 	) ORDER BY TABLE_NAME`
 
-	rows, err := c.db.QueryContext(ctx, query, strings.ToUpper(schema), strings.ToUpper(schema))
+	rows, err := c.session().QueryContext(ctx, query, strings.ToUpper(schema), strings.ToUpper(schema))
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +255,7 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 func (c *connectionImpl) getColumnsForTable(ctx context.Context, schema, table string, columnFilter *string) ([]driverbase.ColumnInfo, error) {
 	query := `SELECT COLUMN_NAME, COLUMN_ID, DATA_TYPE, NULLABLE, DATA_DEFAULT, DATA_PRECISION, DATA_SCALE
 		FROM ALL_TAB_COLUMNS WHERE OWNER = :1 AND TABLE_NAME = :2 ORDER BY COLUMN_ID`
-	rows, err := c.db.QueryContext(ctx, query, strings.ToUpper(schema), strings.ToUpper(table))
+	rows, err := c.session().QueryContext(ctx, query, strings.ToUpper(schema), strings.ToUpper(table))
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +324,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 
 	query := `SELECT COLUMN_NAME, DATA_TYPE, NULLABLE, DATA_PRECISION, DATA_SCALE
 		FROM ALL_TAB_COLUMNS WHERE OWNER = :1 AND TABLE_NAME = :2 ORDER BY COLUMN_ID`
-	rows, err := c.db.QueryContext(ctx, query, schema, strings.ToUpper(tableName))
+	rows, err := c.session().QueryContext(ctx, query, schema, strings.ToUpper(tableName))
 	if err != nil {
 		return nil, c.ErrorHelper.Errorf(adbc.StatusIO, "GetTableSchema: %s", err)
 	}
@@ -266,13 +364,17 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 
 func (c *connectionImpl) GetCurrentCatalog() (string, error) {
 	var name string
-	err := c.db.QueryRow("SELECT ORA_DATABASE_NAME FROM DUAL").Scan(&name)
+	// CurrentNamespacer carries no context; the session is what matters here,
+	// so pass Background rather than reach for the pool's context-free API.
+	err := c.session().QueryRowContext(context.Background(),
+		"SELECT ORA_DATABASE_NAME FROM DUAL").Scan(&name)
 	return name, err
 }
 
 func (c *connectionImpl) GetCurrentDbSchema() (string, error) {
 	var name string
-	err := c.db.QueryRow("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL").Scan(&name)
+	err := c.session().QueryRowContext(context.Background(),
+		"SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL").Scan(&name)
 	return name, err
 }
 
@@ -282,7 +384,8 @@ func (c *connectionImpl) SetCurrentCatalog(catalog string) error {
 }
 
 func (c *connectionImpl) SetCurrentDbSchema(schema string) error {
-	_, err := c.db.Exec("ALTER SESSION SET CURRENT_SCHEMA = " + strings.ToUpper(schema))
+	_, err := c.session().ExecContext(context.Background(),
+		"ALTER SESSION SET CURRENT_SCHEMA = "+strings.ToUpper(schema))
 	if err != nil {
 		return c.ErrorHelper.Errorf(adbc.StatusIO, "failed to set schema: %s", err)
 	}
@@ -292,7 +395,7 @@ func (c *connectionImpl) SetCurrentDbSchema(schema string) error {
 // --- Transactions ---
 
 func (c *connectionImpl) Commit(ctx context.Context) error {
-	_, err := c.db.ExecContext(ctx, "COMMIT")
+	_, err := c.session().ExecContext(ctx, "COMMIT")
 	if err != nil {
 		return c.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
 	}
@@ -300,7 +403,7 @@ func (c *connectionImpl) Commit(ctx context.Context) error {
 }
 
 func (c *connectionImpl) Rollback(ctx context.Context) error {
-	_, err := c.db.ExecContext(ctx, "ROLLBACK")
+	_, err := c.session().ExecContext(ctx, "ROLLBACK")
 	if err != nil {
 		return c.ErrorHelper.Errorf(adbc.StatusIO, "rollback failed: %s", err)
 	}
@@ -308,14 +411,14 @@ func (c *connectionImpl) Rollback(ctx context.Context) error {
 }
 
 func (c *connectionImpl) Close() error {
-	// Don't close the shared pool — it's owned by the database
-	if c.ownsDB && c.db != nil {
-		err := c.db.Close()
-		c.db = nil
-		return err
+	if c.conn == nil {
+		return nil
 	}
-	c.db = nil
-	return nil
+	// The pool belongs to the database, so this returns only the session this
+	// connection owned. The *sql.Conn stays referenced on purpose: database/sql
+	// then reports sql.ErrConnDone for any later use instead of dereferencing
+	// a nil pointer.
+	return c.conn.Close()
 }
 
 // --- Helpers ---

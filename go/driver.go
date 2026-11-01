@@ -33,8 +33,23 @@ const (
 	OptionWalletPassword = "oracle.wallet_password"
 	OptionWalletContent  = "oracle.wallet_content" // Inline ewallet.pem content (avoids temp file)
 	OptionDSN            = "oracle.dsn"
-	OptionPoolSize       = "oracle.pool_size"      // Max open connections (default: 8)
-	OptionIngestWorkers  = "oracle.ingest_workers" // Parallel insert workers (default: 1)
+
+	// pool_size caps the Oracle sessions this database may hold open
+	// (default 8). Each ADBC connection owns one session for its whole life,
+	// and under autocommit each ingest worker borrows one more for the
+	// duration of its batches, so the worst case is roughly
+	// connections * (1 + ingest_workers).
+	OptionPoolSize = "oracle.pool_size"
+
+	// ingest_workers is how many insert workers a bulk ingest may run in
+	// parallel (default 1 for a bound batch, 4 for a bound stream).
+	//
+	// Only honoured with autocommit on, where each worker inserts and commits
+	// on a session of its own. With autocommit off the rows have to land in
+	// the caller's transaction and only the connection's own session is in it,
+	// so ingest runs serially on that session and the caller's Commit decides
+	// the outcome.
+	OptionIngestWorkers = "oracle.ingest_workers"
 
 	// Statement options controlling how Arrow string columns are typed in
 	// ingest CREATE TABLE DDL. VARCHAR2 caps at 4000 bytes; values wider than

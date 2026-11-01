@@ -223,7 +223,9 @@ func (db *databaseImpl) getPool(ctx context.Context) (*sql.DB, error) {
 			return
 		}
 
-		// Allow parallel inserts — set pool size for concurrent batch operations
+		// The pool now bounds concurrent ADBC connections (one owned session
+		// each) plus the extra sessions ingest workers take under autocommit,
+		// so the worst case is roughly connections * (1 + ingest_workers).
 		poolSize := db.poolSize
 		if poolSize <= 0 {
 			poolSize = 8
@@ -247,11 +249,21 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		return nil, db.ErrorHelper.Errorf(adbc.StatusIO, "%s", err)
 	}
 
+	// Check one session out of the pool and keep it for this connection's
+	// whole life. An ADBC connection is a session: ALTER SESSION, CURRENT_SCHEMA,
+	// temp tables and transactions are all session state, and handing out the
+	// pool instead would scatter them across whichever sessions happened to be
+	// free. The pool stays on databaseImpl purely as the session factory.
+	conn, err := pool.Conn(ctx)
+	if err != nil {
+		return nil, db.ErrorHelper.Errorf(adbc.StatusIO, "failed to open Oracle session: %s", err)
+	}
+
 	cnxnBase := driverbase.NewConnectionImplBase(&db.DatabaseImplBase)
 	cnxn := &connectionImpl{
 		ConnectionImplBase: cnxnBase,
 		db:                 pool,
-		ownsDB:             false, // pool is owned by the database, not the connection
+		conn:               conn,
 		ingestWorkers:      db.ingestWorkers,
 		numberMapping:      db.effectiveNumberMapping(),
 	}
