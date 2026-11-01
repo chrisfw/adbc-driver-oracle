@@ -117,3 +117,63 @@ The 72% round-trip wait also means throughput on this fixture is bounded by
 fetch latency, not decode. A columnar decode will show its full value on wider
 rows and on links where a fetch costs more, and the benchmark should grow a
 wide-row variant before 4.2 is measured, or it will understate the result.
+
+## A win 4.1 did not predict: parse decimals without math/big
+
+Profiling the decode-bound fixture (20 x `NUMBER(12,2)`) rather than the narrow
+one changed the picture. There, 76% of wall time is on-CPU, and within it:
+
+```
+60.34%  syscall.rawsyscalln                        (fetch)
+22.39%  appendDecimal128 -> AppendValueFromString   <- this driver's own code
+        -> decimal.Decimal128FromString -> math/big
+```
+
+Arrow's `AppendValueFromString` parses through `math/big`. Oracle `NUMBER`
+columns are almost always far narrower than Decimal128 permits, so the common
+case needs no big integers at all. `parseDecimal128` handles values that fit an
+int64 with no allocation, and refuses everything else so the general path still
+takes exponents, over-long fractions and anything past 18 significant digits.
+
+Correctness came first: the fast path is tested for exact agreement with
+`AppendValueFromString` across the shapes go-ora emits plus the edges, a batch
+mixing accepted and refused values is compared element by element, and the
+refusals are asserted so a value is never silently rounded. A silently wrong
+number would be far worse than a slow parse.
+
+### Result, 5,000,000 rows unless noted
+
+| benchmark | rows/s before | after | speedup | allocs/row before | after | reduction |
+|-----------|-------------:|------:|--------:|-----------------:|------:|----------:|
+| all five columns | 384,677 | 400,676 | 1.04x | 37.0 | 26.1 | 1.42x |
+| `NUMBER` x2 | 842,383 | 1,275,222 | **1.51x** | 25.0 | 14.0 | 1.78x |
+| `VARCHAR2` x1 | 1,905,290 | 1,442,738 | 0.76x | 7.0 | 7.0 | none |
+| temporal x2 | 1,380,656 | 1,392,371 | 1.01x | 11.0 | 11.0 | none |
+| Int64 x1 | 2,209,621 | 2,117,336 | 0.96x | 8.0 | 8.0 | none |
+| 20 x `NUMBER(12,2)`, 200k rows | 66,897 | 135,923 | **2.03x** | 342 (17.1/value) | 123 (6.15/value) | 2.78x |
+
+The columns without decimals are unchanged, as expected, since no code on
+their path moved. `VARCHAR2` at 0.76x and `Int64` at 0.96x are run-to-run
+variance on a benchmark that is mostly fetch wait, not regressions: both paths
+are byte-identical to before. The figure to read is the decimal-heavy one.
+
+`all five columns` gains only 4% in throughput despite 1.42x fewer allocations,
+which is the round-trip bound asserting itself: one of its five columns is a
+decimal, so there is not enough decode work in a row for decode savings to
+show. That is also why the wide fixture exists.
+
+### What is left for 4.2
+
+The remaining per-value cost is go-ora's, and the profile names it:
+`(*Number).decode` and `(*Number).String`, which render every NUMBER to a
+decimal string, plus `decodePrimValue` and the `driver.Value` boxing above it.
+Removing the string round trip entirely is what 4.2's columnar decode is for,
+and it now has a measured size: the fast parser took the decimal path from 17.1
+to 6.15 allocations per value, and the remaining 6 are below this driver.
+
+Note for 4.2's exit criterion, which asks for 3x on the benchmark table: on the
+narrow mixed fixture that target is not reachable by decode work alone, because
+the read is about 72% fetch wait and the ceiling is near 1.4x. On the
+decode-bound fixture there is room, and the fast decimal parser already
+delivered 2.03x of it without touching go-ora. The criterion should be restated
+against a named fixture, or it cannot be judged.

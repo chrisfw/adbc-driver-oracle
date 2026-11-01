@@ -17,8 +17,10 @@ package oracle
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -330,4 +332,141 @@ func TestBenchReadFixtureSchema(t *testing.T) {
 			t.Errorf("column %s is %s, want %s", f.Name, f.Type, w)
 		}
 	}
+}
+
+// =============================================================================
+// Decode-bound fixture
+// =============================================================================
+
+// The mixed fixture is five narrow columns, and a profile shows that read is
+// about 72% waiting on fetch round trips. That bounds what any decode
+// improvement can achieve on it, which matters because 4.2's exit criterion is
+// stated as a multiple of throughput. This second fixture shifts the balance:
+// twenty NUMBER(12,2) columns, so each row carries twenty decimal values to
+// decode and the cost moves from waiting to decoding. Scaled NUMBER is also
+// the most expensive converter, since go-ora renders it to a decimal string
+// that the driver parses back.
+const (
+	benchWideTable = "BENCH_READ_WIDE"
+	benchWideCols  = 20
+)
+
+func benchWideColumnList() string {
+	cols := make([]string, benchWideCols)
+	for i := range cols {
+		cols[i] = fmt.Sprintf(`"V%02d"`, i)
+	}
+	return strings.Join(cols, ", ")
+}
+
+func ensureBenchWideTable(ctx context.Context, tb testing.TB, dsn string, rows int) {
+	tb.Helper()
+
+	db, err := sql.Open("oracle", dsn)
+	if err != nil {
+		tb.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	var have int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+benchWideTable).Scan(&have)
+	if err == nil && have == rows {
+		tb.Logf("fixture %s already has %d rows, reusing", benchWideTable, have)
+		return
+	}
+	if err != nil && !isOraCode(err, 942) {
+		tb.Fatalf("probing %s: %v", benchWideTable, err)
+	}
+
+	defs := make([]string, benchWideCols)
+	sels := make([]string, benchWideCols)
+	for i := range defs {
+		defs[i] = fmt.Sprintf("V%02d NUMBER(12,2)", i)
+		// A different value per column as well as per row, so no column is a
+		// constant that could be decoded once.
+		sels[i] = fmt.Sprintf("ROUND(ROWNUM + %d + MOD(ROWNUM, 97) / 100, 2)", i)
+	}
+
+	start := time.Now()
+	for _, stmt := range []string{
+		`BEGIN EXECUTE IMMEDIATE 'DROP TABLE ` + benchWideTable + ` PURGE'; EXCEPTION WHEN OTHERS THEN NULL; END;`,
+		`CREATE TABLE ` + benchWideTable + ` (` + strings.Join(defs, ", ") + `) NOLOGGING`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			tb.Fatalf("creating wide fixture: %v", err)
+		}
+	}
+
+	const chunk = 50_000
+	inserted := 0
+	for inserted < rows {
+		n := chunk
+		if rows-inserted < n {
+			n = rows - inserted
+		}
+		_, err := db.ExecContext(ctx,
+			`INSERT /*+ APPEND */ INTO `+benchWideTable+` SELECT `+strings.Join(sels, ", ")+
+				` FROM dual CONNECT BY LEVEL <= :1`, n)
+		if err != nil {
+			tb.Fatalf("generating wide rows: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+			tb.Fatalf("commit: %v", err)
+		}
+		inserted += n
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE "+benchWideTable+" LOGGING"); err != nil {
+		tb.Logf("restoring LOGGING: %v", err)
+	}
+	tb.Logf("built fixture %s with %d rows x %d columns in %v",
+		benchWideTable, inserted, benchWideCols, time.Since(start))
+}
+
+// BenchmarkReadWideDecimals is the decode-bound companion to
+// BenchmarkReadMixedTypes. Twenty NUMBER(12,2) columns per row, which is where
+// a columnar decode should show its value and where 4.2's throughput target
+// has room to be met.
+func BenchmarkReadWideDecimals(b *testing.B) {
+	dsn := benchDSN(b)
+	ctx := context.Background()
+	// A fifth of the row count, since each row is four times the columns.
+	rows := benchReadRows() / 5
+	if rows < 1 {
+		rows = 1
+	}
+	ensureBenchWideTable(ctx, b, dsn, rows)
+
+	drv := NewDriver(memory.DefaultAllocator)
+	db, err := drv.NewDatabase(map[string]string{OptionDSN: dsn})
+	if err != nil {
+		b.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+	cnxn, err := db.Open(ctx)
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	defer cnxn.Close()
+
+	query := `SELECT ` + benchWideColumnList() + ` FROM ` + benchWideTable
+	if _, err := readAll(ctx, cnxn, query); err != nil {
+		b.Fatalf("warmup read: %v", err)
+	}
+
+	var total int64
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n, err := readAll(ctx, cnxn, query)
+		if err != nil {
+			b.Fatalf("read: %v", err)
+		}
+		total += n
+	}
+	b.StopTimer()
+
+	if elapsed := b.Elapsed().Seconds(); elapsed > 0 {
+		b.ReportMetric(float64(total)/elapsed, "rows/s")
+		b.ReportMetric(float64(total)*benchWideCols/elapsed, "values/s")
+	}
+	b.ReportMetric(float64(total)/float64(b.N), "rows/op")
 }

@@ -159,11 +159,23 @@ func appendFloat64(b *array.Float64Builder, val interface{}) int64 {
 // AppendValueFromString appends a null itself when parsing fails, so failures
 // must not append again.
 func appendDecimal128(b *array.Decimal128Builder, val interface{}) int64 {
+	scale := b.Type().(*arrow.Decimal128Type).Scale
 	switch v := val.(type) {
 	case string:
-		_ = b.AppendValueFromString(v)
+		// Fast path first: go-ora hands over a plain decimal string and
+		// almost every real NUMBER fits an int64, so this avoids the
+		// math/big round trip AppendValueFromString performs.
+		if n, ok := parseDecimal128(v, scale); ok {
+			b.Append(n)
+		} else {
+			_ = b.AppendValueFromString(v)
+		}
 	case []byte:
-		_ = b.AppendValueFromString(string(v))
+		if n, ok := parseDecimal128(string(v), scale); ok {
+			b.Append(n)
+		} else {
+			_ = b.AppendValueFromString(string(v))
+		}
 	case int64:
 		_ = b.AppendValueFromString(strconv.FormatInt(v, 10))
 	case int32:
