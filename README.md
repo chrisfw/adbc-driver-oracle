@@ -69,6 +69,27 @@ reader, _, _ := stmt.ExecuteQuery(ctx)
 // reader is an Arrow RecordReader with geoarrow.wkb geometry columns
 ```
 
+## Bound parameters
+
+`Bind` plus `ExecuteUpdate` runs the statement once per bound row, sent as a
+single Oracle array execute rather than a round trip each. A 10,000-row bound
+`INSERT` is one execution at the server, which `V$SQL.EXECUTIONS` confirms.
+
+Values are bound in their native Oracle form, using the same converters as
+bulk ingest. A string column whose widest value exceeds the server's inline
+`VARCHAR2` limit binds as a CLOB instead, decided once per batch before
+anything is sent; a prepared statement reused across batches of differing
+widths is re-prepared rather than having a parameter change bind type
+mid-stream.
+
+`ExecuteQuery` with more than one bound row returns `StatusNotImplemented`.
+ADBC specifies one result set per bound row and this driver can return only
+one; it previously answered for row 0 and discarded the rest, which is wrong
+data rather than a missing feature. Bind a single row to query, or use
+`ExecuteUpdate` to run the statement for every row.
+
+`GetParameterSchema` is unimplemented: go-ora describes no bind metadata.
+
 ## Errors
 
 Failures carry the Oracle error code in `adbc.Error.VendorCode` and a SQL:2003

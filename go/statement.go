@@ -22,6 +22,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,6 +52,13 @@ type statementImpl struct {
 	// moves to a different transaction the statement has to be prepared
 	// again. Always nil under autocommit, where there is no transaction.
 	preparedTx *sql.Tx
+
+	// preparedBinds is the bind shape `prepared` was created for, one entry
+	// per parameter. A parameter cannot change bind type between executes of
+	// one prepared statement without desynchronizing go-ora's TTC stream, so
+	// a batch needing a different shape forces a re-prepare. See
+	// resolveStringBinds for what goes wrong otherwise.
+	preparedBinds []bool
 
 	// Bind parameters (single batch)
 	bindParams arrow.RecordBatch
@@ -173,7 +181,7 @@ func (s *statementImpl) Prepare(ctx context.Context) error {
 	// Preparing on the open transaction when there is one: a *sql.Stmt is
 	// bound to whatever began it, and one prepared on the bare session would
 	// execute outside the caller's transaction.
-	_, err := s.preparedStmt(ctx)
+	_, err := s.preparedStmt(ctx, nil)
 	return err
 }
 
@@ -187,8 +195,11 @@ func (s *statementImpl) Prepare(ctx context.Context) error {
 // autocommit) reuses it, a different one prepares again. Returns nil when
 // nothing has been prepared, which is how the execute paths tell the
 // prepared and ad-hoc cases apart.
-func (s *statementImpl) preparedStmt(ctx context.Context) (*sql.Stmt, error) {
-	if s.prepared != nil && s.preparedTx == s.cnxn.tx {
+// preparedStmt returns the statement to execute for the given bind shape,
+// preparing or re-preparing it as needed. A nil shape means the caller binds
+// no arrays and only the transaction matters.
+func (s *statementImpl) preparedStmt(ctx context.Context, shape []bool) (*sql.Stmt, error) {
+	if s.prepared != nil && s.preparedTx == s.cnxn.tx && slices.Equal(s.preparedBinds, shape) {
 		return s.prepared, nil
 	}
 	if s.prepared == nil && !s.explicitlyPrepared {
@@ -209,6 +220,7 @@ func (s *statementImpl) preparedStmt(ctx context.Context) (*sql.Stmt, error) {
 	}
 	s.prepared = stmt
 	s.preparedTx = s.cnxn.tx
+	s.preparedBinds = shape
 	s.explicitlyPrepared = true
 	return s.prepared, nil
 }
@@ -240,10 +252,21 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 		return nil, -1, s.ErrorHelper.Errorf(adbc.StatusInvalidState, "no query set")
 	}
 
+	// ADBC specifies one result set per bound row. This driver can return
+	// only one, and silently answering for row 0 while discarding the rest is
+	// worse than refusing: the caller gets plausible data for the wrong
+	// parameters and no indication of it.
+	if s.bindParams != nil && s.bindParams.NumCols() > 0 && s.bindParams.NumRows() > 1 {
+		return nil, -1, s.ErrorHelper.Errorf(adbc.StatusNotImplemented,
+			"ExecuteQuery with %d bound rows is not supported: ADBC expects one result set per row. "+
+				"Bind a single row to query, or use ExecuteUpdate to run the statement once per row",
+			s.bindParams.NumRows())
+	}
+
 	// Build query args from bind parameters
 	args := s.extractBindArgs(0)
 
-	prepared, err := s.preparedStmt(ctx)
+	prepared, err := s.preparedStmt(ctx, nil)
 	if err != nil {
 		return nil, -1, err
 	}
@@ -289,8 +312,8 @@ func (s *statementImpl) ExecuteUpdate(ctx context.Context) (int64, error) {
 		return -1, s.ErrorHelper.Errorf(adbc.StatusInvalidState, "no query set")
 	}
 
-	exec := func(args []interface{}) (int64, error) {
-		prepared, err := s.preparedStmt(ctx)
+	exec := func(shape []bool, args []interface{}) (int64, error) {
+		prepared, err := s.preparedStmt(ctx, shape)
 		if err != nil {
 			return -1, err
 		}
@@ -317,23 +340,68 @@ func (s *statementImpl) ExecuteUpdate(ctx context.Context) (int64, error) {
 
 	// No parameters bound: execute once.
 	if s.bindParams == nil || s.bindParams.NumCols() == 0 {
-		return exec(nil)
+		return exec(nil, nil)
 	}
 	// A bound batch with zero rows executes zero times.
 	if s.bindParams.NumRows() == 0 {
 		return 0, nil
 	}
 
-	// ADBC semantics: a bound batch executes the statement once per row.
-	var total int64
-	for row := 0; row < int(s.bindParams.NumRows()); row++ {
-		affected, err := exec(s.extractBindArgs(row))
-		if err != nil {
-			return total, err
+	// ADBC semantics are one execution per bound row, which Oracle gives us
+	// as a single array execute rather than a round trip each. go-ora binds a
+	// slice per parameter and reports the total rows affected.
+	shape := s.boundBindShape(ctx, s.bindParams)
+	return exec(shape, s.arrayBindArgs(s.bindParams, shape))
+}
+
+// boundBindShape decides, per parameter, whether a bound column goes in as a
+// CLOB, and so also what bind shape the prepared statement must have.
+//
+// Only string width forces it. A plain string bind rides go-ora's negotiated
+// varchar limit and a wider value is rejected client-side with ORA-01461, so a
+// column holding one must use the Clob bind, which Oracle accepts into VARCHAR2
+// and CLOB columns alike at any width. Deciding before binding rather than
+// retrying after a failure is deliberate: Oracle applies the rows ahead of a
+// mid-array error, so a retry would insert them twice.
+func (s *statementImpl) boundBindShape(ctx context.Context, rec arrow.RecordBatch) []bool {
+	shape := make([]bool, rec.NumCols())
+
+	hasStrings := false
+	for col := 0; col < int(rec.NumCols()); col++ {
+		switch rec.Column(col).DataType().ID() {
+		case arrow.STRING, arrow.LARGE_STRING, arrow.STRING_VIEW:
+			hasStrings = true
 		}
-		total += affected
 	}
-	return total, nil
+	if !hasStrings {
+		// Nothing to measure, and no reason to probe the server for its limit.
+		return shape
+	}
+
+	limit := s.cnxn.inlineStringLimit(ctx)
+	widths := make([]int, rec.NumCols())
+	scanStringWidths(rec, widths)
+	for col := range shape {
+		shape[col] = widths[col] > limit
+	}
+	return shape
+}
+
+// arrayBindArgs converts a bound batch into one go-ora array bind per column.
+//
+// These are the ingest path's converters, which bind values in their native
+// Oracle form. That matters beyond speed: the per-row path this replaces sent
+// a naive Arrow timestamp as time.Time, which go-ora encodes as TIMESTAMP WITH
+// TIME ZONE and so shifts the wall clock by the session zone, and sent a
+// boolean as a Go bool rather than the 0 or 1 a NUMBER(1) column expects.
+func (s *statementImpl) arrayBindArgs(rec arrow.RecordBatch, shape []bool) []interface{} {
+	nrow := int(rec.NumRows())
+	args := make([]interface{}, rec.NumCols())
+	for col := range args {
+		asClob := col < len(shape) && shape[col]
+		args[col] = arrowColumnToSliceRange(rec.Column(col), 0, nrow, asClob)
+	}
+	return args
 }
 
 // extractBindArgs extracts parameter values from the bind RecordBatch at the given row index.
@@ -1758,6 +1826,7 @@ func (s *statementImpl) closePrepared() {
 		s.prepared = nil
 	}
 	s.preparedTx = nil
+	s.preparedBinds = nil
 }
 
 // =============================================================================
