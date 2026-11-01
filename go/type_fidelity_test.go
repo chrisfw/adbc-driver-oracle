@@ -15,10 +15,12 @@
 package oracle
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"math"
+	"net/url"
 	"testing"
 	"time"
 
@@ -663,6 +665,164 @@ func TestIntegration_IntervalSchemaPathsAgree(t *testing.T) {
 			if !arrow.TypeEqual(meta.Field(0).Type, querySchema.Field(0).Type) {
 				t.Errorf("%s: GetTableSchema says %s but ExecuteQuery says %s",
 					ddl, meta.Field(0).Type, querySchema.Field(0).Type)
+			}
+		})
+	}
+}
+
+// --- LOBs ---
+
+func TestOracleLobFetchParam(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"", "INLINE", true}, // unset means the default
+		{LobFetchInline, "INLINE", true},
+		{LobFetchStream, "STREAM", true},
+		{"INLINE", "", false}, // the option takes the lower-case spelling
+		{"pre", "", false},
+		{"nonsense", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := oracleLobFetchParam(tc.in)
+		if ok != tc.wantOK {
+			t.Errorf("oracleLobFetchParam(%q) ok = %v, want %v", tc.in, ok, tc.wantOK)
+			continue
+		}
+		if ok && got != tc.want {
+			t.Errorf("oracleLobFetchParam(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if defaultLobFetch != LobFetchInline {
+		t.Errorf("defaultLobFetch = %q, want %q", defaultLobFetch, LobFetchInline)
+	}
+}
+
+// The mode is a connection parameter, so it has to reach go-ora through the
+// DSN. Asserted on the assembled URL because that is the only place it is
+// expressible.
+func TestAssembledDSNCarriesLobFetch(t *testing.T) {
+	cases := map[string]string{
+		"":             "INLINE",
+		LobFetchInline: "INLINE",
+		LobFetchStream: "STREAM",
+	}
+	for opt, want := range cases {
+		dsn := assembleOracleURL("u", "p", "h", "1521", "s", "", "", opt)
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatalf("assembled DSN does not parse: %v", err)
+		}
+		if got := parsed.Query().Get("LOB FETCH"); got != want {
+			t.Errorf("lob_fetch %q produced LOB FETCH=%q, want %q", opt, got, want)
+		}
+	}
+}
+
+// Character and binary LOBs use the 64-bit offset layout. A String's offsets
+// are int32, so a batch holding more than 2 GiB of text overflows them, and a
+// CLOB column is where that much text comes from. VARCHAR2 and RAW are capped
+// well inside int32 and keep the cheaper 32-bit layout.
+func TestIntegration_LobsUseLargeOffsets(t *testing.T) {
+	const table = "ADBC_T36_LOBTYPES"
+	ctx, cnxn := openTypedConnection(t, nil)
+
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+
+		` ("C" CLOB, "NC" NCLOB, "B" BLOB, "V" VARCHAR2(10), "R" RAW(16))`)
+	defer dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "INSERT INTO "+table+
+		` VALUES (TO_CLOB('c'), TO_NCLOB('n'), HEXTORAW('AABB'), 'v', HEXTORAW('CCDD'))`)
+
+	want := map[string]arrow.DataType{
+		"C":  arrow.BinaryTypes.LargeString,
+		"NC": arrow.BinaryTypes.LargeString,
+		"B":  arrow.BinaryTypes.LargeBinary,
+		"V":  arrow.BinaryTypes.String,
+		"R":  arrow.BinaryTypes.Binary,
+	}
+
+	querySchema, rec := readOneRow(ctx, t, cnxn,
+		`SELECT "C", "NC", "B", "V", "R" FROM `+table)
+	defer rec.Release()
+	for i, f := range querySchema.Fields() {
+		if got := f.Type; !arrow.TypeEqual(got, want[f.Name]) {
+			t.Errorf("ExecuteQuery %s = %s, want %s", f.Name, got, want[f.Name])
+		}
+		if rec.Column(i).IsNull(0) {
+			t.Errorf("%s came back null", f.Name)
+		}
+	}
+
+	// And the metadata path has to say the same, or the schemas diverge.
+	meta, err := cnxn.GetTableSchema(ctx, nil, nil, table)
+	if err != nil {
+		t.Fatalf("GetTableSchema: %v", err)
+	}
+	for _, f := range meta.Fields() {
+		if got := f.Type; !arrow.TypeEqual(got, want[f.Name]) {
+			t.Errorf("GetTableSchema %s = %s, want %s", f.Name, got, want[f.Name])
+		}
+	}
+}
+
+// A multi-megabyte CLOB and BLOB must round-trip byte for byte under both
+// fetch modes. Inline carries the value with its row; stream fetches it
+// separately, which is the point of the option.
+func TestIntegration_MultiMegabyteLobRoundTrip(t *testing.T) {
+	const table = "ADBC_T36_BIGLOB"
+	const size = 3 << 20 // 3 MiB, comfortably past any inline threshold
+
+	// Non-repeating content, so a truncation or a misplaced offset shows up as
+	// a mismatch rather than coinciding with itself.
+	text := make([]byte, size)
+	for i := range text {
+		text[i] = byte('a' + (i*7)%26)
+	}
+	blob := make([]byte, size)
+	for i := range blob {
+		blob[i] = byte(i * 31)
+	}
+
+	for _, mode := range []string{LobFetchInline, LobFetchStream} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cnxn := openTypedConnection(t, map[string]string{OptionLobFetch: mode})
+			dropTable(ctx, t, cnxn, table)
+			defer dropTable(ctx, t, cnxn, table)
+
+			// Write through the ingest path, so this covers both directions.
+			schema := arrow.NewSchema([]arrow.Field{
+				{Name: "txt", Type: arrow.BinaryTypes.LargeString, Nullable: true},
+				{Name: "bin", Type: arrow.BinaryTypes.LargeBinary, Nullable: true},
+			}, nil)
+			b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+			defer b.Release()
+			b.Field(0).(*array.LargeStringBuilder).Append(string(text))
+			b.Field(1).(*array.BinaryBuilder).Append(blob)
+			rec := b.NewRecordBatch()
+			defer rec.Release()
+			ingestBatch(ctx, t, cnxn, table, rec)
+
+			outSchema, out := readOneRow(ctx, t, cnxn, `SELECT "TXT", "BIN" FROM `+table)
+			defer out.Release()
+
+			if got := outSchema.Field(0).Type; !arrow.TypeEqual(got, arrow.BinaryTypes.LargeString) {
+				t.Errorf("txt type = %s, want large_utf8", got)
+			}
+			gotText := out.Column(0).(*array.LargeString).Value(0)
+			if len(gotText) != size {
+				t.Errorf("txt length = %d, want %d", len(gotText), size)
+			} else if gotText != string(text) {
+				t.Error("txt content differs from what was written")
+			}
+
+			gotBlob := out.Column(1).(*array.LargeBinary).Value(0)
+			if len(gotBlob) != size {
+				t.Errorf("bin length = %d, want %d", len(gotBlob), size)
+			} else if !bytes.Equal(gotBlob, blob) {
+				t.Error("bin content differs from what was written")
 			}
 		})
 	}

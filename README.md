@@ -193,6 +193,25 @@ database zone on the way in and renders it in the session zone on the way out,
 so the original is gone before the driver sees it and the column would only
 repeat the session's own offset.
 
+## LOBs
+
+`CLOB`, `NCLOB` and `BLOB` map to Arrow `LargeString` and `LargeBinary`, which
+use 64-bit offsets. A `String` or `Binary` column addresses its values with
+int32 offsets, so a batch carrying more than 2 GiB in one column overflows
+them, and a LOB column is exactly where that much data comes from. `VARCHAR2`
+and `RAW` cap well inside int32 and keep the cheaper 32-bit layout.
+
+`oracle.lob_fetch` chooses how values are retrieved:
+
+| Value | Behaviour |
+|-------|-----------|
+| `inline` (default) | LOB data arrives with its row. No extra round trip, but a batch of large LOBs is held in memory at once. |
+| `stream` | Each LOB is fetched after its row. Lower peak memory for multi-megabyte values, at one round trip each. |
+
+This is a mode rather than a byte threshold because that is what go-ora
+exposes (`LOB FETCH=INLINE|STREAM`); it has no prefetch-size knob for a byte
+option to set.
+
 ## Intervals
 
 `INTERVAL YEAR TO MONTH` arrives as Arrow `MonthInterval`, a count of months,
@@ -280,14 +299,17 @@ Two Oracle behaviours to know about in transactional mode:
 | NUMBER unconstrained, negative scale | String | No declared p,s to build a decimal from |
 | BINARY_FLOAT | Float32 | IEEE single, not widened |
 | BINARY_DOUBLE | Float64 | |
-| VARCHAR2, CHAR, CLOB, NVARCHAR2, NCHAR, NCLOB | String | |
+| VARCHAR2, CHAR, NVARCHAR2, NCHAR | String | |
+| CLOB, NCLOB, LONG | LargeString | 64-bit offsets |
+| ROWID, UROWID | String | |
 | DATE | Timestamp (us, no TZ) | Oracle DATE is wall-clock time; always us |
 | TIMESTAMP(p) | Timestamp (us or ns, no TZ) | Unit from `oracle.timestamp_unit` |
 | TIMESTAMP(p) WITH TIME ZONE | Timestamp (us or ns, UTC) | Normalised to UTC |
 | TIMESTAMP(p) WITH LOCAL TIME ZONE | Timestamp (us or ns, UTC) | Normalised to UTC |
 | INTERVAL YEAR TO MONTH | MonthInterval | Count of months |
 | INTERVAL DAY TO SECOND | Duration (us) | go-ora caps the fraction at 6 digits |
-| RAW, BLOB | Binary | |
+| RAW | Binary | Capped at 32767 bytes |
+| BLOB, LONG RAW, BFILE | LargeBinary | 64-bit offsets |
 | BOOLEAN (Oracle 23c+) | Boolean | |
 | SDO_GEOMETRY | Binary (geoarrow.wkb) | With SRID as PROJJSON CRS |
 

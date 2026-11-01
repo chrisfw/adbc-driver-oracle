@@ -41,12 +41,16 @@ func appendValue(fieldBuilder array.Builder, val interface{}, ct *sql.ColumnType
 		return appendDecimal128(b, val)
 	case *array.StringBuilder:
 		return appendString(b, val)
+	case *array.LargeStringBuilder:
+		return appendLargeString(b, val)
 	case *array.TimestampBuilder:
 		return appendTimestamp(b, val)
 	case *array.DurationBuilder:
 		return appendIntervalDS(b, val)
 	case *array.MonthIntervalBuilder:
 		return appendIntervalYM(b, val)
+	// Covers LargeBinary too: arrow-go builds both through BinaryBuilder and
+	// tells them apart by the data type.
 	case *array.BinaryBuilder:
 		return appendBinary(b, val)
 	case *array.BooleanBuilder:
@@ -177,6 +181,23 @@ func appendDecimal128(b *array.Decimal128Builder, val interface{}) int64 {
 }
 
 func appendString(b *array.StringBuilder, val interface{}) int64 {
+	switch v := val.(type) {
+	case string:
+		b.Append(v)
+		return int64(len(v))
+	case []byte:
+		s := string(v)
+		b.Append(s)
+		return int64(len(s))
+	default:
+		s := fmt.Sprintf("%v", v)
+		b.Append(s)
+		return int64(len(s))
+	}
+}
+
+// appendLargeString fills a CLOB column, which uses the 64-bit offset layout.
+func appendLargeString(b *array.LargeStringBuilder, val interface{}) int64 {
 	switch v := val.(type) {
 	case string:
 		b.Append(v)

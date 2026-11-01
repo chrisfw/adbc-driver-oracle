@@ -754,9 +754,12 @@ func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, pol 
 		return arrow.PrimitiveTypes.Float32
 	case dt == "BINARY_DOUBLE":
 		return arrow.PrimitiveTypes.Float64
+	// See oracleTypeToArrow: LOBs take the 64-bit offset layout so a batch
+	// over 2 GiB of LOB data cannot overflow int32 offsets.
+	case dt == "CLOB" || dt == "NCLOB" || dt == "LONG":
+		return arrow.BinaryTypes.LargeString
 	case dt == "VARCHAR2" || dt == "VARCHAR" || dt == "NVARCHAR2" ||
-		dt == "CHAR" || dt == "NCHAR" || dt == "CLOB" || dt == "NCLOB" ||
-		dt == "LONG" || dt == "ROWID":
+		dt == "CHAR" || dt == "NCHAR" || dt == "ROWID" || dt == "UROWID":
 		return arrow.BinaryTypes.String
 	// Oracle DATE has second granularity, so microseconds is always lossless
 	// for it and the unit policy does not apply.
@@ -778,7 +781,9 @@ func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, pol 
 		return arrow.FixedWidthTypes.MonthInterval
 	case strings.HasPrefix(dt, "INTERVAL"):
 		return arrow.BinaryTypes.String
-	case dt == "RAW" || dt == "LONG RAW" || dt == "BLOB":
+	case dt == "BLOB" || dt == "LONG RAW" || dt == "BFILE":
+		return arrow.BinaryTypes.LargeBinary
+	case dt == "RAW":
 		return arrow.BinaryTypes.Binary
 	case dt == "SDO_GEOMETRY":
 		return arrow.BinaryTypes.Binary

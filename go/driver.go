@@ -69,6 +69,14 @@ const (
 	// while sizing string columns (default 64 MiB).
 	OptionIngestTypeScanLimit = "oracle.ingest.type_scan_limit_bytes"
 
+	// lob_fetch chooses how go-ora retrieves CLOB and BLOB values. See the
+	// LobFetch* constants. Defaults to inline.
+	//
+	// Not a byte count: the plan called for oracle.lob_prefetch_bytes, but
+	// go-ora models this as a mode rather than a threshold and exposes no
+	// size knob, so a byte option would have had nothing to set.
+	OptionLobFetch = "oracle.lob_fetch"
+
 	// timestamp_unit selects the Arrow time unit for TIMESTAMP columns. See
 	// the TimestampUnit* constants. Defaults to microseconds.
 	OptionTimestampUnit = "oracle.timestamp_unit"
@@ -131,6 +139,37 @@ const (
 	// summing correctly. Callers who want the old shape can still ask for it.
 	defaultNumberMapping = NumberMappingDecimal
 )
+
+// Accepted values for OptionLobFetch, which map onto go-ora's LOB FETCH
+// connection parameter.
+const (
+	// LobFetchInline is the default. LOB values arrive with their row, so
+	// reading them costs no extra round trip. Each row carries its LOB data,
+	// so a batch of large LOBs is held in memory at once.
+	LobFetchInline = "inline"
+
+	// LobFetchStream fetches each LOB separately after its row. Lower peak
+	// memory for multi-megabyte values, at one round trip per value.
+	LobFetchStream = "stream"
+
+	// defaultLobFetch is what an unset oracle.lob_fetch means.
+	defaultLobFetch = LobFetchInline
+)
+
+// oracleLobFetchParam maps an OptionLobFetch value to go-ora's DSN value. An
+// empty value means the option was never set.
+func oracleLobFetchParam(val string) (string, bool) {
+	if val == "" {
+		val = defaultLobFetch
+	}
+	switch val {
+	case LobFetchInline:
+		return "INLINE", true
+	case LobFetchStream:
+		return "STREAM", true
+	}
+	return "", false
+}
 
 // Accepted values for OptionTimestampUnit.
 //

@@ -60,6 +60,10 @@ type databaseImpl struct {
 	// OptionTzOffsetColumn.
 	tzOffsetColumn bool
 
+	// lobFetch selects go-ora's LOB retrieval mode. Empty means
+	// defaultLobFetch. See OptionLobFetch.
+	lobFetch string
+
 	// Connection pool — shared across all Open() calls.
 	// sql.DB is already a pool internally; we create it once and reuse.
 	pool     *sql.DB
@@ -105,6 +109,13 @@ func (db *databaseImpl) SetOption(key string, val string) error {
 				OptionNumberMapping, val,
 				NumberMappingFloat, NumberMappingDecimal, NumberMappingString)
 		}
+	case OptionLobFetch:
+		if _, ok := oracleLobFetchParam(val); !ok {
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected %q or %q",
+				OptionLobFetch, val, LobFetchInline, LobFetchStream)
+		}
+		db.lobFetch = val
 	case OptionTzOffsetColumn:
 		switch val {
 		case adbc.OptionValueEnabled:
@@ -154,6 +165,11 @@ func (db *databaseImpl) GetOption(key string) (string, error) {
 		return db.effectiveNumberMapping(), nil
 	case OptionTimestampUnit:
 		return db.effectiveTimestampUnit(), nil
+	case OptionLobFetch:
+		if db.lobFetch == "" {
+			return defaultLobFetch, nil
+		}
+		return db.lobFetch, nil
 	case OptionTzOffsetColumn:
 		if db.tzOffsetColumn {
 			return adbc.OptionValueEnabled, nil
@@ -197,19 +213,21 @@ func (db *databaseImpl) buildDSN() string {
 		if !strings.Contains(db.dsn, "://") && db.walletLocation != "" {
 			if aliases, err := loadTNSAliases(db.walletLocation); err == nil {
 				if entry, ok := aliases[strings.ToLower(db.dsn)]; ok {
-					return assembleOracleURL(db.user, db.password, entry.Host, entry.Port, entry.Service, db.walletLocation, db.walletPassword)
+					return assembleOracleURL(db.user, db.password, entry.Host, entry.Port,
+						entry.Service, db.walletLocation, db.walletPassword, db.lobFetch)
 				}
 			}
 		}
 		return db.dsn
 	}
 
-	return assembleOracleURL(db.user, db.password, db.hostname, db.port, db.serviceName, db.walletLocation, db.walletPassword)
+	return assembleOracleURL(db.user, db.password, db.hostname, db.port, db.serviceName,
+		db.walletLocation, db.walletPassword, db.lobFetch)
 }
 
 // assembleOracleURL builds the oracle://user:pass@host:port/service URL with
 // the same query-parameter conventions used historically by buildDSN.
-func assembleOracleURL(user, password, host, port, service, walletLocation, walletPassword string) string {
+func assembleOracleURL(user, password, host, port, service, walletLocation, walletPassword, lobFetch string) string {
 	dsn := fmt.Sprintf("oracle://%s:%s@%s:%s/%s",
 		url.PathEscape(user),
 		url.PathEscape(password),
@@ -219,6 +237,12 @@ func assembleOracleURL(user, password, host, port, service, walletLocation, wall
 	)
 	params := url.Values{}
 	params.Set("PREFETCH_ROWS", "10000")
+	// go-ora's own default is INLINE, but setting it explicitly keeps the
+	// behaviour pinned to this driver's documented default rather than to
+	// whatever go-ora changes its mind about.
+	if param, ok := oracleLobFetchParam(lobFetch); ok {
+		params.Set("LOB FETCH", param)
+	}
 	if walletLocation != "" {
 		// Wallet implies TCPS for Autonomous Database; switch SSL on.
 		// SSL VERIFY=false matches the wallet's mTLS chain rather than the

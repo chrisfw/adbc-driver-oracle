@@ -2168,10 +2168,18 @@ func oracleTypeToArrow(ct *sql.ColumnType, pol typePolicy) arrow.DataType {
 		dbType == "IBDOUBLE" || dbType == "BDOUBLE":
 		return arrow.PrimitiveTypes.Float64
 
+	// Character LOBs use the 64-bit offset layout. A String column's offsets
+	// are int32, so a batch carrying more than 2 GiB of text overflows them,
+	// and a CLOB column is exactly where that much text comes from. go-ora
+	// reports a CLOB as LongVarChar and Oracle's deprecated LONG the same way;
+	// both are wide text and both belong here.
+	case dbType == "CLOB" || dbType == "NCLOB" || dbType == "OCICLOBLOCATOR" ||
+		dbType == "LONG" || dbType == "LONGVARCHAR":
+		return arrow.BinaryTypes.LargeString
+
 	case dbType == "VARCHAR2" || dbType == "VARCHAR" || dbType == "NVARCHAR2" ||
-		dbType == "CHAR" || dbType == "NCHAR" || dbType == "CLOB" || dbType == "NCLOB" ||
-		dbType == "LONG" || dbType == "LONGVARCHAR" || dbType == "ROWID" || dbType == "UROWID" ||
-		dbType == "OCICLOBLOCATOR":
+		dbType == "CHAR" || dbType == "NCHAR" ||
+		dbType == "ROWID" || dbType == "UROWID":
 		return arrow.BinaryTypes.String
 
 	// Oracle DATE has second granularity, so microseconds is always lossless
@@ -2194,8 +2202,13 @@ func oracleTypeToArrow(ct *sql.ColumnType, pol typePolicy) arrow.DataType {
 	case strings.HasPrefix(dbType, "INTERVAL"):
 		return arrow.BinaryTypes.String
 
-	case dbType == "RAW" || dbType == "LONG RAW" || dbType == "LONGRAW" || dbType == "BLOB" ||
-		dbType == "OCIBLOBLOCATOR" || dbType == "OCIFILELOCATOR":
+	// Binary LOBs, same reasoning as CLOB above. RAW is capped at 32767 bytes
+	// so it keeps the 32-bit layout.
+	case dbType == "BLOB" || dbType == "OCIBLOBLOCATOR" || dbType == "OCIFILELOCATOR" ||
+		dbType == "LONG RAW" || dbType == "LONGRAW":
+		return arrow.BinaryTypes.LargeBinary
+
+	case dbType == "RAW":
 		return arrow.BinaryTypes.Binary
 
 	case dbType == "BOOLEAN":
