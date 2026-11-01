@@ -144,13 +144,44 @@ back to String only where precision and scale cannot describe a Decimal128,
 which is unconstrained `NUMBER` and negative scales. Set `float` to get the
 previous shape back.
 
-One consequence worth knowing before you pick the default: Oracle reports a
-literal or a computed expression as `NUMBER` with a *floating* scale rather
-than a declared one, so there is no precision and scale to build a
-`Decimal128` from. Under `decimal` those columns come back as String, which is
-lossless but not numeric. That covers `SELECT 42`, `COUNT(*)`, `SUM(x)` and any
-arithmetic. Either `CAST` in SQL to give the column a declared type, or set
-`oracle.number_mapping=float`.
+### Unconstrained NUMBER
+
+A `NUMBER` declared without precision and scale has a *per-value* scale, and
+no Arrow decimal can hold that: all four widths carry one fixed precision and
+scale for the whole column, because the format requires every value in a
+column to share a scale. The same is true of the latest Arrow, so there is no
+version to upgrade to that changes it.
+
+Instead the driver samples the data. go-ora renders `NUMBER` as a plain
+decimal string, so the first rows show the digits actually present and a real
+decimal is chosen from them. `oracle.number_scan_rows` controls the sample
+(default 1024; `0` disables it and such columns stay text). This matters most
+for expressions: Oracle reports a literal or computed value as `NUMBER` with a
+floating scale, so `SELECT 42`, `COUNT(*)`, `SUM(x)` and arithmetic are typed
+from their own digits rather than arriving as text.
+
+Precision is taken at the type maximum rather than fitted to the sample, so a
+later row has room. `Decimal128` is used where 38 digits suffice, `Decimal256`
+to 76, and anything wider stays text, which `NUMBER` can reach: `9.99E125`
+renders as 126 integer digits.
+
+**A sample cannot promise anything about later rows**, and Arrow cannot change
+a column's type mid-stream, so a value past the inferred scale has to be
+handled. `oracle.number_overflow` decides how:
+
+| Value | Behaviour |
+|-------|-----------|
+| `error` (default) | Fail the read, naming the column, the value and the options that change it |
+| `null` | Null that value, log once, keep streaming |
+
+There is deliberately no option to round into the inferred scale. Arrow's own
+string parse does exactly that silently (`1.239` into a `decimal(38,2)` stores
+`1.24` and reports no error), and a rounded value looks correct while being
+wrong, which is worse than either outcome above. The driver checks the fit
+itself before appending.
+
+`GetTableSchema` samples the table the same way, so it keeps describing the
+batches queries return.
 
 `GetTableSchema` and `ExecuteQuery` agree on the result under every mapping,
 including for `FLOAT`, which Oracle stores as `NUMBER`. `BINARY_FLOAT` and
@@ -250,6 +281,18 @@ wrong number.
 Ingest in the other direction does not yet map Arrow `Duration` or
 `MonthInterval` onto Oracle interval columns; those still become
 `VARCHAR2` text.
+
+## Interop options
+
+Three options change the Arrow types in ways a consumer may not handle. All
+are off by default, and all are safe to turn on once the consumer is known to
+cope.
+
+| Option | Effect | Risk if the consumer is old |
+|--------|--------|------------------------------|
+| `oracle.compact_decimals` | A declared `NUMBER(p,s)` narrows to `Decimal32` (to 9 digits) or `Decimal64` (to 18) instead of always `Decimal128`. Four bytes a value instead of sixteen for a `NUMBER(4,2)`. | The C data interface spells a non-128 decimal as `d:<precision>,<scale>,<bits>`; a consumer that only parses 128-bit decimals rejects the column. |
+| `oracle.timestamp_with_offset` | `TIMESTAMP WITH TIME ZONE` becomes the canonical `arrow.timestamp_with_offset` extension, carrying the UTC instant and the original offset in one column. Supersedes `oracle.tz_offset_column`. | A consumer that does not know the extension sees a bare `Struct{timestamp, offset_minutes}` rather than a timestamp. |
+| `oracle.opaque_number` | An unconstrained `NUMBER` that could not be inferred is labelled `arrow.opaque` over `utf8` instead of being a plain `utf8` column, so it records that it is an Oracle `NUMBER`. | Less additive than it looks: across the C data interface an unknown extension degrades to its storage type, but in-process the concrete array becomes an extension array and arrow-go's `ExtensionArrayBase.ValueStr` **panics**. Anything doing generic value extraction breaks. |
 
 ## Connections and sessions
 

@@ -34,6 +34,7 @@ import (
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	go_ora "github.com/sijms/go-ora/v2"
 )
@@ -1861,6 +1862,10 @@ const (
 	// than from a declaration, so a later value may not fit it and the
 	// overflow policy applies.
 	outputInferredDecimal
+	// outputTimestampOffset is a TIMESTAMP WITH TIME ZONE carried as the
+	// canonical arrow.timestamp_with_offset extension, which holds the UTC
+	// instant and the original offset in one column.
+	outputTimestampOffset
 )
 
 // outputField links one emitted Arrow column to the Oracle column it reads.
@@ -2034,6 +2039,13 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 			colType = dt
 			kind = outputInferredDecimal
 		}
+		// The canonical extension carries the instant and its offset in one
+		// column, so it replaces both the UTC timestamp and the sibling that
+		// oracle.tz_offset_column would add.
+		if r.policy.timestampWithOffset && hasRecoverableZone(ct.DatabaseTypeName()) {
+			colType = extensions.NewTimestampWithOffsetType(r.policy.effectiveTimeUnit())
+			kind = outputTimestampOffset
+		}
 		fields = append(fields, arrow.Field{
 			Name:     ct.Name(),
 			Type:     colType,
@@ -2041,7 +2053,8 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 		})
 		r.outputs = append(r.outputs, outputField{col: i, kind: kind})
 
-		if r.policy.tzOffsetColumn && hasRecoverableZone(ct.DatabaseTypeName()) {
+		if r.policy.tzOffsetColumn && !r.policy.timestampWithOffset &&
+			hasRecoverableZone(ct.DatabaseTypeName()) {
 			fields = append(fields, arrow.Field{
 				Name:     ct.Name() + tzColumnSuffix,
 				Type:     arrow.BinaryTypes.String,
@@ -2134,6 +2147,8 @@ func (r *oracleRecordReader) AppendRows(builder *array.RecordBuilder) (int64, in
 				rowSize += r.appendGeometry(builder.Field(field), val)
 			case outputZone:
 				rowSize += appendZone(builder.Field(field), val)
+			case outputTimestampOffset:
+				rowSize += appendTimestampWithOffset(builder.Field(field), val)
 			case outputInferredDecimal:
 				size, err := r.appendInferredDecimal(builder.Field(field), val, r.colTypes[o.col].Name())
 				if err != nil {
@@ -2149,6 +2164,26 @@ func (r *oracleRecordReader) AppendRows(builder *array.RecordBuilder) (int64, in
 	}
 
 	return rows, rowSize, nil
+}
+
+// appendTimestampWithOffset fills a column carried as the canonical
+// arrow.timestamp_with_offset extension. The builder derives both the UTC
+// instant and the offset in minutes from the value's location, which is where
+// go-ora puts the zone Oracle stored.
+func appendTimestampWithOffset(fieldBuilder array.Builder, val interface{}) int64 {
+	b, ok := fieldBuilder.(*extensions.TimestampWithOffsetBuilder)
+	if !ok {
+		fieldBuilder.AppendNull()
+		return 0
+	}
+	t, ok := val.(time.Time)
+	if !ok {
+		b.AppendNull()
+		return 0
+	}
+	b.Append(t)
+	// Eight bytes of timestamp plus two of offset.
+	return 10
 }
 
 // appendZone writes the zone a timestamp arrived in: the IANA region name when
@@ -2263,6 +2298,15 @@ type typePolicy struct {
 	timestampWithOffset bool
 }
 
+// effectiveTimeUnit is timestampUnit with the zero value resolved, so a
+// policy built without one does not produce a seconds-resolution column.
+func (p typePolicy) effectiveTimeUnit() arrow.TimeUnit {
+	if p.timestampUnit == 0 {
+		return arrow.Microsecond
+	}
+	return p.timestampUnit
+}
+
 // oracleIntervalDS builds the Arrow type for an INTERVAL DAY TO SECOND.
 //
 // Always microseconds, and deliberately not following oracle.timestamp_unit.
@@ -2316,7 +2360,7 @@ func oracleTypeToArrow(ct *sql.ColumnType, pol typePolicy) arrow.DataType {
 	switch {
 	case dbType == "NUMBER":
 		precision, scale, ok := ct.DecimalSize()
-		return numberToArrow(precision, scale, ok, pol.numberMapping)
+		return numberToArrowWith(precision, scale, ok, pol)
 	// BINARY_FLOAT is an IEEE single and go-ora decodes it to a Go float32,
 	// so widening it to Float64 only invented precision the column never had
 	// and doubled the width of every value.

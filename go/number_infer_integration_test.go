@@ -212,3 +212,79 @@ func TestIntegration_NumberTooWideForAnyDecimalFallsBack(t *testing.T) {
 		t.Error("the value was lost; the fallback must keep it")
 	}
 }
+
+// compact_decimals narrows a declared NUMBER(p,s) to the smallest Arrow
+// decimal that holds it, which is four bytes a value instead of sixteen for a
+// NUMBER(4,2). Off by default because the C data interface spells a non-128
+// decimal as "d:p,s,bits" and a consumer that only parses 128-bit decimals
+// rejects it.
+func TestIntegration_CompactDecimals(t *testing.T) {
+	const table = "ADBC_T4N_COMPACT"
+
+	cols := []struct {
+		ddl       string
+		plain     arrow.DataType
+		compacted arrow.DataType
+	}{
+		{`"A" NUMBER(4,2)`, &arrow.Decimal128Type{Precision: 4, Scale: 2}, &arrow.Decimal32Type{Precision: 4, Scale: 2}},
+		{`"B" NUMBER(12,2)`, &arrow.Decimal128Type{Precision: 12, Scale: 2}, &arrow.Decimal64Type{Precision: 12, Scale: 2}},
+		{`"C" NUMBER(30,4)`, &arrow.Decimal128Type{Precision: 30, Scale: 4}, &arrow.Decimal128Type{Precision: 30, Scale: 4}},
+	}
+	var defs []string
+	for _, c := range cols {
+		defs = append(defs, c.ddl)
+	}
+
+	for _, on := range []bool{false, true} {
+		name := "off"
+		opts := map[string]string{}
+		if on {
+			name = "on"
+			opts[OptionCompactDecimals] = adbc.OptionValueEnabled
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cnxn := openTypedConnection(t, opts)
+			dropTable(ctx, t, cnxn, table)
+			execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+" ("+strings.Join(defs, ", ")+")")
+			defer dropTable(ctx, t, cnxn, table)
+			execUpdate(ctx, t, cnxn, "INSERT INTO "+table+" VALUES (1.25, 1234.56, 12345.6789)")
+
+			schema, rec := readOneRow(ctx, t, cnxn, `SELECT "A", "B", "C" FROM `+table)
+			defer rec.Release()
+
+			for i, c := range cols {
+				want := c.plain
+				if on {
+					want = c.compacted
+				}
+				if got := schema.Field(i).Type; !arrow.TypeEqual(got, want) {
+					t.Errorf("column %d: got %s, want %s", i, got, want)
+				}
+				// Values must survive the narrowing, not just the type. A
+				// missing builder case would null the whole column.
+				if rec.Column(i).IsNull(0) {
+					t.Errorf("column %d came back null; the narrowed builder lost the value", i)
+				}
+			}
+			// And the values must be right.
+			if got := rec.Column(0).ValueStr(0); got != "1.25" {
+				t.Errorf("A = %q, want 1.25", got)
+			}
+			if got := rec.Column(1).ValueStr(0); got != "1234.56" {
+				t.Errorf("B = %q, want 1234.56", got)
+			}
+
+			// Both schema paths have to agree about the narrowing too.
+			meta, err := cnxn.GetTableSchema(ctx, nil, nil, table)
+			if err != nil {
+				t.Fatalf("GetTableSchema: %v", err)
+			}
+			for i := 0; i < meta.NumFields(); i++ {
+				if !arrow.TypeEqual(meta.Field(i).Type, schema.Field(i).Type) {
+					t.Errorf("column %d: GetTableSchema says %s but ExecuteQuery says %s",
+						i, meta.Field(i).Type, schema.Field(i).Type)
+				}
+			}
+		})
+	}
+}

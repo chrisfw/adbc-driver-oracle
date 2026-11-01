@@ -26,6 +26,7 @@ import (
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/extensions"
 )
 
 type connectionImpl struct {
@@ -570,6 +571,9 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 
 		pol := c.typePolicy()
 		colType := oracleDataTypeToArrow(dataType, prec, scale, pol)
+		if pol.timestampWithOffset && ddlHasRecoverableZone(dataType) {
+			colType = extensions.NewTimestampWithOffsetType(pol.effectiveTimeUnit())
+		}
 		// An unconstrained NUMBER gets its type from the data in the query
 		// path, so the dictionary has to sample too or the two schemas
 		// describe the same column differently, which is the defect 2.1
@@ -585,7 +589,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 		})
 		// The sibling zone column has to appear here too, or this schema
 		// stops describing the batches ExecuteQuery returns.
-		if pol.tzOffsetColumn && ddlHasRecoverableZone(dataType) {
+		if pol.tzOffsetColumn && !pol.timestampWithOffset && ddlHasRecoverableZone(dataType) {
 			fields = append(fields, arrow.Field{
 				Name:     name + tzColumnSuffix,
 				Type:     arrow.BinaryTypes.String,
@@ -864,7 +868,7 @@ func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, pol 
 	// IEEE floats, are reported as themselves, and stay Float64.
 	case dt == "NUMBER" || dt == "FLOAT":
 		p, s, ok := decimalSizeFromMetadata(precision, scale)
-		return numberToArrow(p, s, ok, pol.numberMapping)
+		return numberToArrowWith(p, s, ok, pol)
 	case dt == "BINARY_FLOAT":
 		return arrow.PrimitiveTypes.Float32
 	case dt == "BINARY_DOUBLE":

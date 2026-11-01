@@ -1140,3 +1140,117 @@ func mustGetDBOption(t *testing.T, db adbc.Database, key string) string {
 	}
 	return v
 }
+
+// --- oracle.timestamp_with_offset ---
+
+// The canonical arrow.timestamp_with_offset extension carries the UTC instant
+// and the original offset in one column, which is a standard form of what
+// oracle.tz_offset_column builds by hand as a sibling String column. Opt-in,
+// because a consumer that does not know the extension sees a bare struct
+// rather than a timestamp.
+func TestIntegration_TimestampWithOffsetExtension(t *testing.T) {
+	const table = "ADBC_T4T_TSOFF"
+	ctx, cnxn := openTypedConnection(t, map[string]string{
+		OptionTimestampWithOffset: adbc.OptionValueEnabled,
+	})
+
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+
+		` ("ID" NUMBER(10), "T" TIMESTAMP(6) WITH TIME ZONE, "N" TIMESTAMP(6))`)
+	defer dropTable(ctx, t, cnxn, table)
+
+	rows := []struct {
+		id      int
+		literal string
+		wantUTC string
+		wantOff int16
+	}{
+		{1, "TIMESTAMP '2024-07-01 12:00:00 America/New_York'", "2024-07-01T16:00:00Z", -240},
+		{2, "TIMESTAMP '2024-01-15 12:00:00 America/New_York'", "2024-01-15T17:00:00Z", -300},
+		{3, "TIMESTAMP '2024-07-01 12:00:00 +05:30'", "2024-07-01T06:30:00Z", 330},
+		{4, "TIMESTAMP '2024-07-01 12:00:00 UTC'", "2024-07-01T12:00:00Z", 0},
+	}
+	for _, r := range rows {
+		execUpdate(ctx, t, cnxn, fmt.Sprintf("INSERT INTO %s VALUES (%d, %s, %s)",
+			table, r.id, r.literal, r.literal))
+	}
+
+	schema, rec := readOneRow(ctx, t, cnxn, `SELECT "T", "N" FROM `+table+` ORDER BY "ID"`)
+	defer rec.Release()
+
+	// Only the zoned column becomes the extension; a naive TIMESTAMP does not.
+	ext, ok := schema.Field(0).Type.(arrow.ExtensionType)
+	if !ok {
+		t.Fatalf("zoned column is %s, want the extension type", schema.Field(0).Type)
+	}
+	if got := ext.ExtensionName(); got != "arrow.timestamp_with_offset" {
+		t.Errorf("extension name = %q, want arrow.timestamp_with_offset", got)
+	}
+	if _, isExt := schema.Field(1).Type.(arrow.ExtensionType); isExt {
+		t.Errorf("naive TIMESTAMP became %s; it has no offset to carry", schema.Field(1).Type)
+	}
+	// No sibling column: the extension replaces it.
+	if schema.NumFields() != 2 {
+		var names []string
+		for _, f := range schema.Fields() {
+			names = append(names, f.Name)
+		}
+		t.Errorf("columns = %v, want just T and N", names)
+	}
+
+	// The storage is the documented struct, and both fields have to be right.
+	st, ok := rec.Column(0).(array.ExtensionArray).Storage().(*array.Struct)
+	if !ok {
+		t.Fatalf("storage is %T, want *array.Struct", rec.Column(0).(array.ExtensionArray).Storage())
+	}
+	tsCol := st.Field(0).(*array.Timestamp)
+	offCol := st.Field(1).(*array.Int16)
+	unit := schema.Field(0).Type.(arrow.ExtensionType).StorageType().(*arrow.StructType).
+		Field(0).Type.(*arrow.TimestampType).Unit
+
+	for i, r := range rows {
+		gotUTC := tsCol.Value(i).ToTime(unit).UTC().Format("2006-01-02T15:04:05Z")
+		if gotUTC != r.wantUTC {
+			t.Errorf("row %d instant = %s, want %s", r.id, gotUTC, r.wantUTC)
+		}
+		if got := offCol.Value(i); got != r.wantOff {
+			t.Errorf("row %d offset = %d minutes, want %d", r.id, got, r.wantOff)
+		}
+	}
+
+	// And GetTableSchema must name the same type.
+	meta, err := cnxn.GetTableSchema(ctx, nil, nil, table)
+	if err != nil {
+		t.Fatalf("GetTableSchema: %v", err)
+	}
+	if !arrow.TypeEqual(meta.Field(1).Type, schema.Field(0).Type) {
+		t.Errorf("GetTableSchema says %s but ExecuteQuery says %s",
+			meta.Field(1).Type, schema.Field(0).Type)
+	}
+}
+
+// With both options set the extension wins, since it already carries what the
+// sibling column was for and two representations of one fact would be worse
+// than either.
+func TestIntegration_TimestampWithOffsetSupersedesSibling(t *testing.T) {
+	const table = "ADBC_T4T_BOTH"
+	ctx, cnxn := openTypedConnection(t, map[string]string{
+		OptionTimestampWithOffset: adbc.OptionValueEnabled,
+		OptionTzOffsetColumn:      adbc.OptionValueEnabled,
+	})
+
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+` ("T" TIMESTAMP(6) WITH TIME ZONE)`)
+	defer dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "INSERT INTO "+table+" VALUES (SYSTIMESTAMP)")
+
+	schema, rec := readOneRow(ctx, t, cnxn, `SELECT "T" FROM `+table)
+	defer rec.Release()
+	if schema.NumFields() != 1 {
+		var names []string
+		for _, f := range schema.Fields() {
+			names = append(names, f.Name)
+		}
+		t.Errorf("columns = %v, want only T; the extension replaces the sibling", names)
+	}
+}
