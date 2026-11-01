@@ -21,8 +21,11 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"sort"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
@@ -825,5 +828,227 @@ func TestIntegration_MultiMegabyteLobRoundTrip(t *testing.T) {
 				t.Error("bin content differs from what was written")
 			}
 		})
+	}
+}
+
+// --- ROWID and character sets ---
+
+// ROWID and UROWID stay String. They are opaque locators, not data, so there
+// is nothing to gain from a richer type and a consumer needs the text form to
+// feed back into a WHERE clause.
+func TestIntegration_RowidStaysString(t *testing.T) {
+	const table = "ADBC_T37_ROWID"
+	ctx, cnxn := openTypedConnection(t, nil)
+
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+` ("ID" NUMBER(10), "R" VARCHAR2(40))`)
+	defer dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "INSERT INTO "+table+" VALUES (1, 'x')")
+
+	// The pseudo-column is the only way to get a real ROWID type.
+	schema, rec := readOneRow(ctx, t, cnxn, `SELECT ROWID AS "RID" FROM `+table)
+	defer rec.Release()
+
+	if got := schema.Field(0).Type; !arrow.TypeEqual(got, arrow.BinaryTypes.String) {
+		t.Fatalf("ROWID type = %s, want utf8", got)
+	}
+	rid := rec.Column(0).(*array.String).Value(0)
+	if rid == "" {
+		t.Fatal("ROWID came back empty")
+	}
+	// It has to be usable as a locator, which is the reason to keep the text.
+	if got := querySingleString(ctx, t, cnxn,
+		`SELECT "ID" FROM `+table+` WHERE ROWID = '`+rid+`'`); got != "1" {
+		t.Errorf("round-tripped ROWID selected %q, want 1", got)
+	}
+
+	// Both declared ROWID types map the same way through the metadata path.
+	for _, dt := range []string{"ROWID", "UROWID"} {
+		got := oracleDataTypeToArrow(dt, sql.NullInt64{}, sql.NullInt64{}, typePolicy{})
+		if !arrow.TypeEqual(got, arrow.BinaryTypes.String) {
+			t.Errorf("%s = %s, want utf8", dt, got)
+		}
+	}
+}
+
+// Non-ASCII text must come out as correct UTF-8 across every character type,
+// including through an ingest round trip.
+//
+// The database under test is AL32UTF8 with AL16UTF16 for NCHAR, which is the
+// Autonomous Database default and the realistic case. The plan also wanted a
+// WE8MSWIN1252 database; that needs a separately provisioned instance, so what
+// is covered here is the conversion go-ora performs, with multi-byte, 4-byte
+// and combining sequences that a naive byte-length or single-byte assumption
+// would corrupt.
+func TestIntegration_NonASCIIRoundTrip(t *testing.T) {
+	const table = "ADBC_T37_CHARSET"
+	ctx, cnxn := openTypedConnection(t, nil)
+
+	samples := map[string]string{
+		"ascii":      "plain ascii",
+		"latin1":     "héllo wörld àçé",
+		"cyrillic":   "Здравствуй мир",
+		"cjk":        "日本語テキスト",
+		"emoji":      "a\U0001F600b\U0001F1EF\U0001F1F5c", // 4-byte runes, including a flag pair
+		"combining":  "égalité",                         // e + combining acute, not precomposed
+		"rtl":        "مرحبا بالعالم",
+		"mixedquote": `it's "quoted" and \backslashed\`,
+	}
+
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+
+		` ("K" VARCHAR2(100), "V" VARCHAR2(400), "NV" NVARCHAR2(400), "C" CLOB)`)
+	defer dropTable(ctx, t, cnxn, table)
+
+	// Write through bound parameters, so the bind path is covered as well as
+	// the read path.
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "k", Type: arrow.BinaryTypes.String},
+		{Name: "v", Type: arrow.BinaryTypes.String},
+		{Name: "nv", Type: arrow.BinaryTypes.String},
+		{Name: "c", Type: arrow.BinaryTypes.String},
+	}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer b.Release()
+	keys := make([]string, 0, len(samples))
+	for k := range samples {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		b.Field(0).(*array.StringBuilder).Append(k)
+		b.Field(1).(*array.StringBuilder).Append(samples[k])
+		b.Field(2).(*array.StringBuilder).Append(samples[k])
+		b.Field(3).(*array.StringBuilder).Append(samples[k])
+	}
+	rec := b.NewRecordBatch()
+	defer rec.Release()
+
+	stmt, err := cnxn.NewStatement()
+	if err != nil {
+		t.Fatalf("NewStatement: %v", err)
+	}
+	defer stmt.Close()
+	if err := stmt.SetSqlQuery("INSERT INTO " + table +
+		` ("K", "V", "NV", "C") VALUES (:1, :2, :3, :4)`); err != nil {
+		t.Fatalf("SetSqlQuery: %v", err)
+	}
+	if err := stmt.Bind(ctx, rec); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if _, err := stmt.ExecuteUpdate(ctx); err != nil {
+		t.Fatalf("ExecuteUpdate: %v", err)
+	}
+
+	_, out := readOneRow(ctx, t, cnxn, `SELECT "K", "V", "NV", "C" FROM `+table+` ORDER BY "K"`)
+	defer out.Release()
+
+	kCol := out.Column(0).(*array.String)
+	vCol := out.Column(1).(*array.String)
+	nvCol := out.Column(2).(*array.String)
+	cCol := out.Column(3).(*array.LargeString)
+
+	if kCol.Len() != len(keys) {
+		t.Fatalf("got %d rows, want %d", kCol.Len(), len(keys))
+	}
+	for i := 0; i < kCol.Len(); i++ {
+		key := kCol.Value(i)
+		want := samples[key]
+		for name, got := range map[string]string{
+			"VARCHAR2":  vCol.Value(i),
+			"NVARCHAR2": nvCol.Value(i),
+			"CLOB":      cCol.Value(i),
+		} {
+			if !utf8.ValidString(got) {
+				t.Errorf("%s %s: output is not valid UTF-8: %q", key, name, got)
+				continue
+			}
+			if got != want {
+				t.Errorf("%s %s: got %q (% x), want %q (% x)", key, name, got, got, want, want)
+			}
+		}
+	}
+}
+
+// The VARCHAR2 width boundaries, which is where a byte-length assumption
+// breaks: 4000 bytes is the STANDARD inline cap and 32767 the EXTENDED one.
+// Multi-byte content makes byte length and character count differ, so a column
+// sized in characters holds fewer runes than bytes.
+func TestIntegration_StringWidthBoundaries(t *testing.T) {
+	const table = "ADBC_T37_WIDTHS"
+	ctx, cnxn := openTypedConnection(t, nil)
+
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"empty", ""},
+		{"one", "x"},
+		{"3999 bytes", strings.Repeat("a", 3999)},
+		{"4000 bytes", strings.Repeat("a", 4000)},
+		{"4001 bytes", strings.Repeat("a", 4001)},
+		{"32767 bytes", strings.Repeat("a", 32767)},
+		{"32768 bytes", strings.Repeat("a", 32768)},
+		// Same byte lengths, but multi-byte, so the character count is lower.
+		{"4000 bytes of 3-byte runes", strings.Repeat("語", 4000/3)},
+		{"33000 bytes of 2-byte runes", strings.Repeat("é", 33000/2)},
+	}
+
+	dropTable(ctx, t, cnxn, table)
+	// CLOB, so every width fits and the test is about fidelity rather than
+	// about the column limit.
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+` ("ID" NUMBER(10), "V" CLOB)`)
+	defer dropTable(ctx, t, cnxn, table)
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "v", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer b.Release()
+	for i, c := range cases {
+		b.Field(0).(*array.Int64Builder).Append(int64(i))
+		b.Field(1).(*array.StringBuilder).Append(c.value)
+	}
+	rec := b.NewRecordBatch()
+	defer rec.Release()
+
+	stmt, err := cnxn.NewStatement()
+	if err != nil {
+		t.Fatalf("NewStatement: %v", err)
+	}
+	defer stmt.Close()
+	if err := stmt.SetSqlQuery("INSERT INTO " + table + ` ("ID", "V") VALUES (:1, :2)`); err != nil {
+		t.Fatalf("SetSqlQuery: %v", err)
+	}
+	if err := stmt.Bind(ctx, rec); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if _, err := stmt.ExecuteUpdate(ctx); err != nil {
+		t.Fatalf("ExecuteUpdate: %v", err)
+	}
+
+	_, out := readOneRow(ctx, t, cnxn, `SELECT "ID", "V" FROM `+table+` ORDER BY "ID"`)
+	defer out.Release()
+	vals := out.Column(1).(*array.LargeString)
+
+	for i, c := range cases {
+		if vals.IsNull(i) {
+			// Oracle stores the empty string as NULL, which is its own
+			// documented behaviour rather than a fidelity failure.
+			if c.value == "" {
+				continue
+			}
+			t.Errorf("%s: came back null", c.name)
+			continue
+		}
+		got := vals.Value(i)
+		if len(got) != len(c.value) {
+			t.Errorf("%s: got %d bytes, want %d", c.name, len(got), len(c.value))
+			continue
+		}
+		if got != c.value {
+			t.Errorf("%s: content differs", c.name)
+		}
 	}
 }

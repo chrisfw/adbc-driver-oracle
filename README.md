@@ -193,6 +193,24 @@ database zone on the way in and renders it in the session zone on the way out,
 so the original is gone before the driver sees it and the column would only
 repeat the session's own offset.
 
+## Character sets
+
+Text comes out as UTF-8 regardless of the database character set; go-ora
+converts on the way through. Verified against an AL32UTF8 database with
+AL16UTF16 `NCHAR`, which is the Autonomous Database default, across
+`VARCHAR2`, `NVARCHAR2` and `CLOB`, with Latin-1, Cyrillic, CJK, right-to-left,
+combining-mark and 4-byte emoji content, in both directions through bound
+parameters and back.
+
+Two Oracle behaviours to expect rather than debug:
+
+- **The empty string is NULL.** Oracle does not distinguish them for character
+  types, so a round-tripped `""` comes back as a null. This is why ingest also
+  skips `NOT NULL` on string columns.
+- **Column widths are bytes by default.** `VARCHAR2(4000)` holds 4000 *bytes*,
+  so about 1333 three-byte characters. Declare `VARCHAR2(n CHAR)` to size in
+  characters.
+
 ## LOBs
 
 `CLOB`, `NCLOB` and `BLOB` map to Arrow `LargeString` and `LargeBinary`, which
