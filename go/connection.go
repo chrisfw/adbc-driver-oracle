@@ -77,6 +77,10 @@ type connectionImpl struct {
 	// OptionTzOffsetColumn.
 	tzOffsetColumn bool
 
+	// partitionCount is the default slice count for ExecutePartitions, which
+	// a statement may override.
+	partitionCount int
+
 	// numberScanRows samples rows to infer a type for unconstrained NUMBER;
 	// 0 disables it. See OptionNumberScanRows.
 	numberScanRows int

@@ -68,6 +68,10 @@ type databaseImpl struct {
 	// defaultPrefetchRows. See OptionPrefetchRows.
 	prefetchRows int
 
+	// partitionCount is how many slices ExecutePartitions aims for. Zero
+	// means unset, which resolves to defaultPartitionCount.
+	partitionCount int
+
 	// numberScanRows samples rows to infer a type for unconstrained NUMBER.
 	// Negative means unset; 0 disables inference. See OptionNumberScanRows.
 	numberScanRows int
@@ -141,6 +145,14 @@ func (db *databaseImpl) SetOption(key string, val string) error {
 				OptionNumberScanRows, val)
 		}
 		db.numberScanRows = n
+	case OptionPartitionCount:
+		n, err := strconv.Atoi(val)
+		if err != nil || n < 1 {
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected a positive integer (1 means do not split)",
+				OptionPartitionCount, val)
+		}
+		db.partitionCount = n
 	case OptionNumberOverflow:
 		switch val {
 		case NumberOverflowError, NumberOverflowNull:
@@ -291,6 +303,14 @@ func (db *databaseImpl) effectiveNumberScanRows() int {
 		return defaultNumberScanRows
 	}
 	return db.numberScanRows
+}
+
+// effectivePartitionCount resolves the unset value to the default.
+func (db *databaseImpl) effectivePartitionCount() int {
+	if db.partitionCount < 1 {
+		return defaultPartitionCount
+	}
+	return db.partitionCount
 }
 
 // effectiveNumberOverflow resolves the unset value to the default.
@@ -460,6 +480,7 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		tzOffsetColumn:     db.tzOffsetColumn,
 
 		numberScanRows:      db.effectiveNumberScanRows(),
+		partitionCount:      db.effectivePartitionCount(),
 		numberOverflow:      db.effectiveNumberOverflow(),
 		compactDecimals:     db.compactDecimals,
 		timestampWithOffset: db.timestampWithOffset,

@@ -92,6 +92,9 @@ type statementImpl struct {
 	// the bind type then follows that column type rather than this limit, via
 	// resolveStringBinds.
 	inlineLimit int
+	// partitionCountOpt overrides the connection's partition count for this
+	// statement. Zero means unset.
+	partitionCountOpt int
 }
 
 func (s *statementImpl) Base() *driverbase.StatementImplBase {
@@ -132,6 +135,14 @@ func (s *statementImpl) SetOption(key, value string) error {
 			}
 		}
 		return nil
+	case OptionPartitionCount:
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 {
+			return s.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"%s must be a positive integer (1 means do not split) (got %q)", OptionPartitionCount, value)
+		}
+		s.partitionCountOpt = n
+		return nil
 	case OptionIngestTypeScanLimit:
 		n, err := strconv.ParseInt(value, 10, 64)
 		if err != nil || n < 0 {
@@ -164,6 +175,8 @@ func (s *statementImpl) GetOption(key string) (string, error) {
 		}
 		sort.Strings(cols)
 		return strings.Join(cols, ","), nil
+	case OptionPartitionCount:
+		return strconv.Itoa(s.partitionCount()), nil
 	case OptionIngestTypeScanLimit:
 		if !s.ingestScanLimitSet {
 			return strconv.FormatInt(defaultTypeScanLimitBytes, 10), nil
@@ -1821,10 +1834,6 @@ func (s *statementImpl) GetParameterSchema() (*arrow.Schema, error) {
 	return nil, s.ErrorHelper.Errorf(adbc.StatusNotImplemented, "GetParameterSchema")
 }
 
-func (s *statementImpl) ExecutePartitions(ctx context.Context) (*arrow.Schema, adbc.Partitions, int64, error) {
-	return nil, adbc.Partitions{}, -1, s.ErrorHelper.Errorf(adbc.StatusNotImplemented, "ExecutePartitions")
-}
-
 func (s *statementImpl) Close() error {
 	s.closePrepared()
 	if s.bindParams != nil {
@@ -1907,6 +1916,17 @@ type oracleRecordReader struct {
 
 	// logger is used for the overflow warning. May be nil.
 	logger *slog.Logger
+
+	// forcedTypes pins the Arrow type of a column that would otherwise be
+	// inferred from data, keyed by Oracle column index. A partitioned read
+	// sets it: each slice sees only part of the data, so slices left to infer
+	// would disagree with each other and with the schema ExecutePartitions
+	// returned.
+	forcedTypes map[int]arrow.DataType
+
+	// inferredTypes records what inference decided, so a caller that built
+	// this reader to sample the data can pin the same types elsewhere.
+	inferredTypes map[int]arrow.DataType
 }
 
 // peekRows reads up to n more rows into the peek buffer, stopping early at end
@@ -1955,6 +1975,11 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 	if n := r.policy.numberScanRows; n > 0 {
 		for i, ct := range colTypes {
 			if strings.ToUpper(ct.DatabaseTypeName()) != "NUMBER" {
+				continue
+			}
+			// A pinned type is not re-derived. Sampling this slice could
+			// reach a different answer, and the promised schema wins.
+			if _, pinned := r.forcedTypes[i]; pinned {
 				continue
 			}
 			p, s, ok := ct.DecimalSize()
@@ -2011,6 +2036,12 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 			}
 		}
 	}
+	for i, dt := range r.forcedTypes {
+		if i >= 0 && i < len(colTypes) {
+			inferred[i] = dt
+		}
+	}
+	r.inferredTypes = inferred
 
 	// Build the emitted schema. It is not always one Arrow column per Oracle
 	// column: with oracle.tz_offset_column on, a TIMESTAMP WITH TIME ZONE

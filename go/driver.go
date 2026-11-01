@@ -80,6 +80,16 @@ const (
 	// and why precision is taken at the maximum rather than fitted.
 	OptionNumberScanRows = "oracle.number_scan_rows"
 
+	// partition_count is how many slices ExecutePartitions splits a query
+	// into, so they can be read concurrently (default 4).
+	//
+	// It is a request, not a guarantee. A partitioned table yields one slice
+	// per partition regardless, since a PARTITION clause names exactly one.
+	// A query that cannot be split safely yields a single slice rather than
+	// an error. See partition.go for the strategy ladder and why the last
+	// rung multiplies server I/O.
+	OptionPartitionCount = "oracle.partition_count"
+
 	// number_overflow is what happens when a value does not fit the type
 	// inferred from the sample: "error" (default) fails the read naming the
 	// column and value, "null" nulls that value and logs once.
