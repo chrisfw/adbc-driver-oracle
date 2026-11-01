@@ -369,3 +369,166 @@ func TestIntegration_TimestampWithTimeZoneDSTBoundary(t *testing.T) {
 		}
 	}
 }
+
+// --- oracle.tz_offset_column ---
+
+func TestHasRecoverableZone(t *testing.T) {
+	// Wire names, as go-ora reports them.
+	if !hasRecoverableZone("TimeStampTZ_DTY") {
+		t.Error("TIMESTAMP WITH TIME ZONE should have a recoverable zone")
+	}
+	for _, name := range []string{"TimeStampLTZ_DTY", "TimeStampDTY", "DATE", "NUMBER"} {
+		if hasRecoverableZone(name) {
+			t.Errorf("%s should not have a recoverable zone", name)
+		}
+	}
+
+	// Declared names, as ALL_TAB_COLUMNS spells them.
+	for _, ddl := range []string{"TIMESTAMP(6) WITH TIME ZONE", "TIMESTAMP(9) WITH TIME ZONE"} {
+		if !ddlHasRecoverableZone(ddl) {
+			t.Errorf("%s should have a recoverable zone", ddl)
+		}
+	}
+	// LOCAL TIME ZONE contains "WITH TIME ZONE" as a substring, so the check
+	// has to exclude it explicitly rather than match loosely.
+	for _, ddl := range []string{
+		"TIMESTAMP(6) WITH LOCAL TIME ZONE",
+		"TIMESTAMP(6)",
+		"DATE",
+		"NUMBER",
+	} {
+		if ddlHasRecoverableZone(ddl) {
+			t.Errorf("%s should not have a recoverable zone", ddl)
+		}
+	}
+}
+
+// With the option on, a TIMESTAMP WITH TIME ZONE gains a sibling column
+// carrying the zone the value was written with, which UTC normalisation
+// otherwise discards. The instant stays correct in the main column.
+func TestIntegration_TzOffsetColumn(t *testing.T) {
+	const table = "ADBC_T34_TZCOL"
+
+	type row struct {
+		id      int
+		literal string
+		wantUTC string
+		wantTZ  string
+	}
+	rows := []row{
+		// A stored IANA region comes back by name.
+		{1, "TIMESTAMP '2024-07-01 12:00:00 America/New_York'", "2024-07-01T16:00:00Z", "America/New_York"},
+		{2, "TIMESTAMP '2024-01-15 12:00:00 America/New_York'", "2024-01-15T17:00:00Z", "America/New_York"},
+		{3, "TIMESTAMP '2024-07-01 12:00:00 Europe/London'", "2024-07-01T11:00:00Z", "Europe/London"},
+		// A stored fixed offset comes back as that offset.
+		{4, "TIMESTAMP '2024-07-01 12:00:00 +05:30'", "2024-07-01T06:30:00Z", "+05:30"},
+		{5, "TIMESTAMP '2024-07-01 12:00:00 UTC'", "2024-07-01T12:00:00Z", "UTC"},
+	}
+
+	ctx, cnxn := openTypedConnection(t, map[string]string{
+		OptionTzOffsetColumn: adbc.OptionValueEnabled,
+	})
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+
+		" (ID NUMBER(10), T TIMESTAMP(6) WITH TIME ZONE, L TIMESTAMP(6) WITH LOCAL TIME ZONE, N TIMESTAMP(6))")
+	defer dropTable(ctx, t, cnxn, table)
+	for _, r := range rows {
+		execUpdate(ctx, t, cnxn, fmt.Sprintf("INSERT INTO %s VALUES (%d, %s, %s, %s)",
+			table, r.id, r.literal, r.literal, r.literal))
+	}
+
+	schema, rec := readOneRow(ctx, t, cnxn,
+		`SELECT "ID", "T", "L", "N" FROM `+table+` ORDER BY "ID"`)
+	defer rec.Release()
+
+	// Only the zoned column gets a sibling, and it lands immediately after it.
+	var names []string
+	for _, f := range schema.Fields() {
+		names = append(names, f.Name)
+	}
+	want := []string{"ID", "T", "T" + tzColumnSuffix, "L", "N"}
+	if len(names) != len(want) {
+		t.Fatalf("columns = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("columns = %v, want %v", names, want)
+		}
+	}
+	if got := schema.Field(2).Type; !arrow.TypeEqual(got, arrow.BinaryTypes.String) {
+		t.Errorf("sibling type = %s, want utf8", got)
+	}
+
+	tsType := schema.Field(1).Type.(*arrow.TimestampType)
+	if tsType.TimeZone != "UTC" {
+		t.Errorf("value column = %s, want UTC-normalised", tsType)
+	}
+	tsCol := rec.Column(1).(*array.Timestamp)
+	tzCol := rec.Column(2).(*array.String)
+
+	for i, r := range rows {
+		gotUTC := tsCol.Value(i).ToTime(tsType.Unit).UTC().Format("2006-01-02T15:04:05Z")
+		if gotUTC != r.wantUTC {
+			t.Errorf("row %d instant = %s, want %s", r.id, gotUTC, r.wantUTC)
+		}
+		if got := tzCol.Value(i); got != r.wantTZ {
+			t.Errorf("row %d zone = %q, want %q", r.id, got, r.wantTZ)
+		}
+	}
+}
+
+// The option is off by default, so an existing consumer sees no extra column.
+func TestIntegration_TzOffsetColumnDefaultsOff(t *testing.T) {
+	const table = "ADBC_T34_TZOFF"
+	ctx, cnxn := openTypedConnection(t, nil)
+
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+" (T TIMESTAMP(6) WITH TIME ZONE)")
+	defer dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "INSERT INTO "+table+" VALUES (SYSTIMESTAMP)")
+
+	schema, rec := readOneRow(ctx, t, cnxn, `SELECT "T" FROM `+table)
+	defer rec.Release()
+	if schema.NumFields() != 1 {
+		var names []string
+		for _, f := range schema.Fields() {
+			names = append(names, f.Name)
+		}
+		t.Errorf("columns = %v, want just T", names)
+	}
+}
+
+// GetTableSchema has to emit the sibling as well, or it stops describing the
+// batches ExecuteQuery returns. This is 2.1's invariant applied to a feature
+// that changes the column list rather than a column's type.
+func TestIntegration_TzOffsetColumnAppearsInTableSchema(t *testing.T) {
+	const table = "ADBC_T34_TZMETA"
+	ctx, cnxn := openTypedConnection(t, map[string]string{
+		OptionTzOffsetColumn: adbc.OptionValueEnabled,
+	})
+
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+
+		" (T TIMESTAMP(6) WITH TIME ZONE, L TIMESTAMP(6) WITH LOCAL TIME ZONE)")
+	defer dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "INSERT INTO "+table+" VALUES (SYSTIMESTAMP, SYSTIMESTAMP)")
+
+	meta, err := cnxn.GetTableSchema(ctx, nil, nil, table)
+	if err != nil {
+		t.Fatalf("GetTableSchema: %v", err)
+	}
+	querySchema, rec := readOneRow(ctx, t, cnxn, `SELECT "T", "L" FROM `+table)
+	defer rec.Release()
+
+	if meta.NumFields() != querySchema.NumFields() {
+		t.Fatalf("GetTableSchema has %d columns, ExecuteQuery has %d",
+			meta.NumFields(), querySchema.NumFields())
+	}
+	for i := 0; i < meta.NumFields(); i++ {
+		m, q := meta.Field(i), querySchema.Field(i)
+		if m.Name != q.Name || !arrow.TypeEqual(m.Type, q.Type) {
+			t.Errorf("column %d: GetTableSchema says %s %s but ExecuteQuery says %s %s",
+				i, m.Name, m.Type, q.Name, q.Type)
+		}
+	}
+}

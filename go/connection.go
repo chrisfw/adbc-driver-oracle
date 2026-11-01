@@ -71,6 +71,10 @@ type connectionImpl struct {
 	// databaseImpl.effectiveTimestampUnit.
 	timestampUnit arrow.TimeUnit
 
+	// tzOffsetColumn emits the "<col>__tz" sibling columns. See
+	// OptionTzOffsetColumn.
+	tzOffsetColumn bool
+
 	varcharOnce  sync.Once
 	varcharLimit int // cached inline VARCHAR2 byte cap; see inlineStringLimit
 }
@@ -79,8 +83,9 @@ type connectionImpl struct {
 // paths must use.
 func (c *connectionImpl) typePolicy() typePolicy {
 	return typePolicy{
-		numberMapping: c.numberMapping,
-		timestampUnit: c.timestampUnit,
+		numberMapping:  c.numberMapping,
+		timestampUnit:  c.timestampUnit,
+		tzOffsetColumn: c.tzOffsetColumn,
 	}
 }
 
@@ -535,12 +540,21 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 			return nil, err
 		}
 
-		arrowType := oracleDataTypeToArrow(dataType, prec, scale, c.typePolicy())
+		pol := c.typePolicy()
 		fields = append(fields, arrow.Field{
 			Name:     name,
-			Type:     arrowType,
+			Type:     oracleDataTypeToArrow(dataType, prec, scale, pol),
 			Nullable: nullable == "Y",
 		})
+		// The sibling zone column has to appear here too, or this schema
+		// stops describing the batches ExecuteQuery returns.
+		if pol.tzOffsetColumn && ddlHasRecoverableZone(dataType) {
+			fields = append(fields, arrow.Field{
+				Name:     name + tzColumnSuffix,
+				Type:     arrow.BinaryTypes.String,
+				Nullable: true,
+			})
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -767,6 +781,15 @@ func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, pol 
 	default:
 		return arrow.BinaryTypes.String
 	}
+}
+
+// ddlHasRecoverableZone is hasRecoverableZone for a declared type name, which
+// is how ALL_TAB_COLUMNS spells it: "TIMESTAMP(6) WITH TIME ZONE" or
+// "TIMESTAMP(6) WITH LOCAL TIME ZONE". Only the former still carries the zone
+// its values were written with.
+func ddlHasRecoverableZone(dataType string) bool {
+	dt := strings.ToUpper(dataType)
+	return strings.Contains(dt, "WITH TIME ZONE") && !strings.Contains(dt, "LOCAL")
 }
 
 // decimalSizeFromMetadata translates ALL_TAB_COLUMNS precision and scale into

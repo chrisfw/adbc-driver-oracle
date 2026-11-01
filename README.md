@@ -178,6 +178,21 @@ fail: Arrow wraps them silently, so a year-1500 date becomes a plausible but
 wrong instant. Only choose `ns` when the data is known to fall inside that
 window.
 
+### Recovering the original time zone
+
+`TIMESTAMP WITH TIME ZONE` is normalised to UTC on the way out, so the instant
+is never ambiguous, but the zone it was written in is lost. Set
+`oracle.tz_offset_column=true` to emit a sibling String column named
+`<col>__tz` immediately after each such column, holding the IANA region Oracle
+stored (`America/New_York`) or a fixed offset (`+05:30`) when that is what was
+stored. `GetTableSchema` reports the sibling too, so it still describes the
+batches queries return.
+
+`TIMESTAMP WITH LOCAL TIME ZONE` gets no sibling. Oracle normalises it to the
+database zone on the way in and renders it in the session zone on the way out,
+so the original is gone before the driver sees it and the column would only
+repeat the session's own offset.
+
 ## Connections and sessions
 
 Each ADBC connection owns one Oracle session for its whole life, checked out of

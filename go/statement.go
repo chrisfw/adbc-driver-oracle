@@ -1847,9 +1847,25 @@ func (s *statementImpl) closePrepared() {
 // oracleRecordReader — implements driverbase.RecordReaderImpl
 // =============================================================================
 
+// outputKind says what an emitted Arrow column carries.
+type outputKind uint8
+
+const (
+	outputValue outputKind = iota
+	outputGeometry
+	outputZone
+)
+
+// outputField links one emitted Arrow column to the Oracle column it reads.
+type outputField struct {
+	col  int
+	kind outputKind
+}
+
 type oracleRecordReader struct {
 	rows        *sql.Rows
 	colTypes    []*sql.ColumnType
+	outputs     []outputField
 	scanDest    []interface{}
 	scanVals    []interface{}
 	geomIndices []int
@@ -1867,7 +1883,6 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 	}
 	r.colTypes = colTypes
 
-	fields := make([]arrow.Field, len(colTypes))
 	r.geomIndices = nil
 
 	// Detect geometry columns. go-ora reports SDO_GEOMETRY natively for the
@@ -1886,26 +1901,61 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 		srid = r.peekSRID()
 	}
 
-	// Build schema
+	// Build the emitted schema. It is not always one Arrow column per Oracle
+	// column: with oracle.tz_offset_column on, a TIMESTAMP WITH TIME ZONE
+	// contributes a second column carrying the zone it arrived in. r.outputs
+	// records what each emitted column reads, so AppendRows does not have to
+	// rediscover it per row.
 	geomCols := make(map[int]struct{}, len(r.geomIndices))
 	for _, idx := range r.geomIndices {
 		geomCols[idx] = struct{}{}
 	}
+
+	fields := make([]arrow.Field, 0, len(colTypes))
+	r.outputs = make([]outputField, 0, len(colTypes))
 	for i, ct := range colTypes {
 		nullable, _ := ct.Nullable()
 
 		if _, ok := geomCols[i]; ok {
-			fields[i] = GeoArrowWKBField(ct.Name(), srid, nullable)
-		} else {
-			fields[i] = arrow.Field{
-				Name:     ct.Name(),
-				Type:     oracleTypeToArrow(ct, r.policy),
-				Nullable: nullable,
-			}
+			fields = append(fields, GeoArrowWKBField(ct.Name(), srid, nullable))
+			r.outputs = append(r.outputs, outputField{col: i, kind: outputGeometry})
+			continue
+		}
+
+		fields = append(fields, arrow.Field{
+			Name:     ct.Name(),
+			Type:     oracleTypeToArrow(ct, r.policy),
+			Nullable: nullable,
+		})
+		r.outputs = append(r.outputs, outputField{col: i, kind: outputValue})
+
+		if r.policy.tzOffsetColumn && hasRecoverableZone(ct.DatabaseTypeName()) {
+			fields = append(fields, arrow.Field{
+				Name:     ct.Name() + tzColumnSuffix,
+				Type:     arrow.BinaryTypes.String,
+				Nullable: true,
+			})
+			r.outputs = append(r.outputs, outputField{col: i, kind: outputZone})
 		}
 	}
 
 	return arrow.NewSchema(fields, nil), nil
+}
+
+// tzColumnSuffix names the sibling column oracle.tz_offset_column emits.
+const tzColumnSuffix = "__tz"
+
+// hasRecoverableZone reports whether a column's values still carry the zone
+// they were written with.
+//
+// TIMESTAMP WITH TIME ZONE does: Oracle stores the region or offset alongside
+// the instant, and go-ora hands it back in the time.Time's location. WITH
+// LOCAL TIME ZONE does not: Oracle normalises it to the database zone on the
+// way in and renders it in the session zone on the way out, so the original is
+// gone before the driver sees it and a sibling column would only repeat the
+// session's own offset.
+func hasRecoverableZone(dbTypeName string) bool {
+	return strings.ToUpper(dbTypeName) == "TIMESTAMPTZ_DTY"
 }
 
 func (r *oracleRecordReader) BeginAppending(builder *array.RecordBuilder) error {
@@ -1941,22 +1991,38 @@ func (r *oracleRecordReader) AppendRows(builder *array.RecordBuilder) (int64, in
 	}
 
 	var rowSize int64
-	geomSet := make(map[int]bool, len(r.geomIndices))
-	for _, idx := range r.geomIndices {
-		geomSet[idx] = true
-	}
-
-	for i, val := range r.scanVals {
-		if geomSet[i] {
-			size := r.appendGeometry(builder.Field(i), val)
-			rowSize += size
-		} else {
-			size := appendValue(builder.Field(i), val, r.colTypes[i])
-			rowSize += size
+	for field, o := range r.outputs {
+		val := r.scanVals[o.col]
+		switch o.kind {
+		case outputGeometry:
+			rowSize += r.appendGeometry(builder.Field(field), val)
+		case outputZone:
+			rowSize += appendZone(builder.Field(field), val)
+		default:
+			rowSize += appendValue(builder.Field(field), val, r.colTypes[o.col])
 		}
 	}
 
 	return 1, rowSize, nil
+}
+
+// appendZone writes the zone a timestamp arrived in: the IANA region name when
+// Oracle stored one ("America/New_York"), otherwise the fixed offset
+// ("+05:30"), which is exactly what go-ora puts in the value's location.
+func appendZone(fieldBuilder array.Builder, val interface{}) int64 {
+	b, ok := fieldBuilder.(*array.StringBuilder)
+	if !ok {
+		fieldBuilder.AppendNull()
+		return 0
+	}
+	t, ok := val.(time.Time)
+	if !ok {
+		b.AppendNull()
+		return 0
+	}
+	name := t.Location().String()
+	b.Append(name)
+	return int64(len(name))
 }
 
 func (r *oracleRecordReader) appendGeometry(fieldBuilder array.Builder, val interface{}) int64 {
@@ -2030,6 +2096,11 @@ var timestampNoTZ = &arrow.TimestampType{Unit: arrow.Microsecond}
 type typePolicy struct {
 	numberMapping string
 	timestampUnit arrow.TimeUnit
+
+	// tzOffsetColumn emits a sibling String column next to every TIMESTAMP
+	// WITH TIME ZONE, carrying the zone the value arrived in. See
+	// OptionTzOffsetColumn.
+	tzOffsetColumn bool
 }
 
 // oracleTimestamp builds the Arrow type for an Oracle TIMESTAMP under this

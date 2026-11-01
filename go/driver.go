@@ -73,6 +73,19 @@ const (
 	// the TimestampUnit* constants. Defaults to microseconds.
 	OptionTimestampUnit = "oracle.timestamp_unit"
 
+	// tz_offset_column, when "true", emits a sibling String column named
+	// "<col>__tz" after every TIMESTAMP WITH TIME ZONE column, holding the
+	// zone that value arrived in: the IANA region name Oracle stored
+	// ("America/New_York"), or a fixed offset ("+05:30") when that is what was
+	// stored. Defaults to "false".
+	//
+	// The timestamp itself stays UTC-normalised either way, so the instant is
+	// never ambiguous; this recovers the local zone that the normalisation
+	// discards, which is what a report rendered in the originating zone needs.
+	// TIMESTAMP WITH LOCAL TIME ZONE gets no sibling: Oracle normalises it on
+	// the way in, so the original zone is gone before the driver sees it.
+	OptionTzOffsetColumn = "oracle.tz_offset_column"
+
 	// number_mapping selects how Oracle NUMBER columns are typed in the
 	// result Arrow schema. See the NumberMapping* constants. Defaults to
 	// NumberMappingDecimal, which preserves every digit Oracle stores.

@@ -56,6 +56,10 @@ type databaseImpl struct {
 	// Empty means defaultTimestampUnit. See OptionTimestampUnit.
 	timestampUnit string
 
+	// tzOffsetColumn emits the "<col>__tz" sibling columns. See
+	// OptionTzOffsetColumn.
+	tzOffsetColumn bool
+
 	// Connection pool — shared across all Open() calls.
 	// sql.DB is already a pool internally; we create it once and reuse.
 	pool     *sql.DB
@@ -101,6 +105,17 @@ func (db *databaseImpl) SetOption(key string, val string) error {
 				OptionNumberMapping, val,
 				NumberMappingFloat, NumberMappingDecimal, NumberMappingString)
 		}
+	case OptionTzOffsetColumn:
+		switch val {
+		case adbc.OptionValueEnabled:
+			db.tzOffsetColumn = true
+		case adbc.OptionValueDisabled:
+			db.tzOffsetColumn = false
+		default:
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected %q or %q",
+				OptionTzOffsetColumn, val, adbc.OptionValueEnabled, adbc.OptionValueDisabled)
+		}
 	case OptionTimestampUnit:
 		if _, ok := arrowTimeUnit(val); !ok {
 			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
@@ -139,6 +154,11 @@ func (db *databaseImpl) GetOption(key string) (string, error) {
 		return db.effectiveNumberMapping(), nil
 	case OptionTimestampUnit:
 		return db.effectiveTimestampUnit(), nil
+	case OptionTzOffsetColumn:
+		if db.tzOffsetColumn {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
 	default:
 		return db.DatabaseImplBase.GetOption(key)
 	}
@@ -296,6 +316,7 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		ingestWorkers:      db.ingestWorkers,
 		numberMapping:      db.effectiveNumberMapping(),
 		timestampUnit:      db.effectiveArrowTimeUnit(),
+		tzOffsetColumn:     db.tzOffsetColumn,
 	}
 	// Transactions are begun with a context scoped to the connection, not to
 	// the statement that happens to start one: database/sql rolls a
