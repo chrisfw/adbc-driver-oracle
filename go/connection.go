@@ -522,7 +522,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 			return nil, err
 		}
 
-		arrowType := oracleDataTypeToArrow(dataType, prec, scale)
+		arrowType := oracleDataTypeToArrow(dataType, prec, scale, c.numberMapping)
 		fields = append(fields, arrow.Field{
 			Name:     name,
 			Type:     arrowType,
@@ -704,19 +704,26 @@ func (c *connectionImpl) Close() error {
 
 // --- Helpers ---
 
-// oracleDataTypeToArrow converts an Oracle data type name (from ALL_TAB_COLUMNS) to an Arrow type.
-func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64) arrow.DataType {
+// oracleDataTypeToArrow converts an Oracle data type name (from ALL_TAB_COLUMNS)
+// to an Arrow type.
+//
+// numberMapping must be the connection's resolved policy. This path and the
+// result-set path (oracleTypeToArrow) have to produce the same type for the
+// same column, or GetTableSchema describes a table that ExecuteQuery does not
+// return, so both send NUMBER through numberToArrow rather than reimplementing
+// the policy.
+func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, numberMapping string) arrow.DataType {
 	dt := strings.ToUpper(dataType)
 	switch {
-	case dt == "NUMBER":
-		if scale.Valid && scale.Int64 == 0 && precision.Valid && precision.Int64 > 0 && precision.Int64 <= 18 {
-			return arrow.PrimitiveTypes.Int64
-		}
-		if scale.Valid && scale.Int64 == 0 && precision.Valid && precision.Int64 > 18 {
-			return arrow.BinaryTypes.String
-		}
-		return arrow.PrimitiveTypes.Float64
-	case dt == "FLOAT" || dt == "BINARY_FLOAT" || dt == "BINARY_DOUBLE":
+	// FLOAT is an ANSI synonym stored as NUMBER, and go-ora reports it as
+	// NUMBER on the wire, so it has to take the NUMBER route or the two
+	// schemas disagree: under the decimal policy a query returned String
+	// while this said Float64. BINARY_FLOAT and BINARY_DOUBLE are genuine
+	// IEEE floats, are reported as themselves, and stay Float64.
+	case dt == "NUMBER" || dt == "FLOAT":
+		p, s, ok := decimalSizeFromMetadata(precision, scale)
+		return numberToArrow(p, s, ok, numberMapping)
+	case dt == "BINARY_FLOAT" || dt == "BINARY_DOUBLE":
 		return arrow.PrimitiveTypes.Float64
 	case dt == "VARCHAR2" || dt == "VARCHAR" || dt == "NVARCHAR2" ||
 		dt == "CHAR" || dt == "NCHAR" || dt == "CLOB" || dt == "NCLOB" ||
@@ -737,6 +744,30 @@ func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64) arro
 	default:
 		return arrow.BinaryTypes.String
 	}
+}
+
+// decimalSizeFromMetadata translates ALL_TAB_COLUMNS precision and scale into
+// the triple sql.ColumnType.DecimalSize reports for the same column, so both
+// schema paths hand numberToArrow identical values.
+//
+// They differ only in how an unconstrained NUMBER arrives. The data dictionary
+// leaves DATA_PRECISION and DATA_SCALE null; go-ora substitutes Oracle's -127
+// "floating" scale with 0xFF, which surfaces as 255 (see oracleScaleSentinel).
+// A null scale therefore has to become that sentinel and not zero, which would
+// read as an integral column and map to Int64.
+//
+// ok is always true: reaching here means the data dictionary described a
+// NUMBER, which is exactly what DecimalSize reporting true means.
+func decimalSizeFromMetadata(precision, scale sql.NullInt64) (int64, int64, bool) {
+	var p int64
+	if precision.Valid {
+		p = precision.Int64
+	}
+	s := int64(oracleScaleSentinel)
+	if scale.Valid {
+		s = scale.Int64
+	}
+	return p, s, true
 }
 
 // matchLike performs SQL LIKE-style matching (% wildcard only).
