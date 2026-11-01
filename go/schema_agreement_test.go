@@ -113,14 +113,19 @@ func TestSchemaPathsAgreeOnNumber(t *testing.T) {
 }
 
 // BINARY_FLOAT and BINARY_DOUBLE are genuine IEEE floats, not NUMBER, so the
-// number mapping must not touch them. Guards against over-applying the fix
-// above to every numeric-looking type.
+// number mapping must not touch them. Guards against over-applying the NUMBER
+// fix above to every numeric-looking type. Each keeps its own width: a single
+// stays a single rather than being widened to a double.
 func TestBinaryFloatsIgnoreNumberMapping(t *testing.T) {
-	for _, dt := range []string{"BINARY_FLOAT", "BINARY_DOUBLE"} {
+	cases := map[string]arrow.DataType{
+		"BINARY_FLOAT":  arrow.PrimitiveTypes.Float32,
+		"BINARY_DOUBLE": arrow.PrimitiveTypes.Float64,
+	}
+	for dt, want := range cases {
 		for _, mapping := range []string{NumberMappingFloat, NumberMappingDecimal, NumberMappingString} {
 			got := oracleDataTypeToArrow(dt, sql.NullInt64{}, sql.NullInt64{}, mapping)
-			if !arrow.TypeEqual(got, arrow.PrimitiveTypes.Float64) {
-				t.Errorf("%s under %s: got %s, want float64", dt, mapping, got)
+			if !arrow.TypeEqual(got, want) {
+				t.Errorf("%s under %s: got %s, want %s", dt, mapping, got, want)
 			}
 		}
 	}

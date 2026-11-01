@@ -2049,9 +2049,15 @@ func oracleTypeToArrow(ct *sql.ColumnType, numberMapping string) arrow.DataType 
 	case dbType == "NUMBER":
 		precision, scale, ok := ct.DecimalSize()
 		return numberToArrow(precision, scale, ok, numberMapping)
-	case dbType == "FLOAT" || dbType == "BINARY_FLOAT" || dbType == "BINARY_DOUBLE" ||
-		dbType == "IBFLOAT" || dbType == "IBDOUBLE" || // TNS names for BINARY_FLOAT/DOUBLE
-		dbType == "BFLOAT" || dbType == "BDOUBLE":
+	// BINARY_FLOAT is an IEEE single and go-ora decodes it to a Go float32,
+	// so widening it to Float64 only invented precision the column never had
+	// and doubled the width of every value.
+	case dbType == "BINARY_FLOAT" || dbType == "IBFLOAT" || dbType == "BFLOAT":
+		return arrow.PrimitiveTypes.Float32
+	// FLOAT is listed for completeness; go-ora reports a FLOAT column as
+	// NUMBER on the wire, so it is handled by the NUMBER case above.
+	case dbType == "FLOAT" || dbType == "BINARY_DOUBLE" ||
+		dbType == "IBDOUBLE" || dbType == "BDOUBLE":
 		return arrow.PrimitiveTypes.Float64
 
 	case dbType == "VARCHAR2" || dbType == "VARCHAR" || dbType == "NVARCHAR2" ||

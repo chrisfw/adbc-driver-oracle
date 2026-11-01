@@ -723,7 +723,9 @@ func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, numb
 	case dt == "NUMBER" || dt == "FLOAT":
 		p, s, ok := decimalSizeFromMetadata(precision, scale)
 		return numberToArrow(p, s, ok, numberMapping)
-	case dt == "BINARY_FLOAT" || dt == "BINARY_DOUBLE":
+	case dt == "BINARY_FLOAT":
+		return arrow.PrimitiveTypes.Float32
+	case dt == "BINARY_DOUBLE":
 		return arrow.PrimitiveTypes.Float64
 	case dt == "VARCHAR2" || dt == "VARCHAR" || dt == "NVARCHAR2" ||
 		dt == "CHAR" || dt == "NCHAR" || dt == "CLOB" || dt == "NCLOB" ||

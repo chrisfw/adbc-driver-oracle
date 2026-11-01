@@ -33,6 +33,8 @@ func appendValue(fieldBuilder array.Builder, val interface{}, ct *sql.ColumnType
 	switch b := fieldBuilder.(type) {
 	case *array.Int64Builder:
 		return appendInt64(b, val)
+	case *array.Float32Builder:
+		return appendFloat32(b, val)
 	case *array.Float64Builder:
 		return appendFloat64(b, val)
 	case *array.Decimal128Builder:
@@ -86,6 +88,34 @@ func appendInt64(b *array.Int64Builder, val interface{}) int64 {
 		b.AppendNull()
 	}
 	return 8
+}
+
+// appendFloat32 fills a BINARY_FLOAT column. go-ora decodes the column to a
+// Go float32, so that case is the one that runs; the others cover values
+// reaching this builder by another route.
+func appendFloat32(b *array.Float32Builder, val interface{}) int64 {
+	switch v := val.(type) {
+	case float32:
+		b.Append(v)
+	case float64:
+		b.Append(float32(v))
+	case int64:
+		b.Append(float32(v))
+	case int32:
+		b.Append(float32(v))
+	case int:
+		b.Append(float32(v))
+	case string:
+		f, err := strconv.ParseFloat(v, 32)
+		if err != nil {
+			b.AppendNull()
+		} else {
+			b.Append(float32(f))
+		}
+	default:
+		b.AppendNull()
+	}
+	return 4
 }
 
 func appendFloat64(b *array.Float64Builder, val interface{}) int64 {

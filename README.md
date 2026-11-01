@@ -218,8 +218,10 @@ Two Oracle behaviours to know about in transactional mode:
 | Oracle Type | Arrow Type | Notes |
 |------------|------------|-------|
 | NUMBER (integer, p<=18) | Int64 | |
-| NUMBER (integer, p>18) | String | Preserves full precision |
-| NUMBER (decimal), FLOAT, BINARY_FLOAT/DOUBLE | Float64 | |
+| NUMBER (p,s), FLOAT | Decimal128(p,s) | Default mapping; see NUMBER mapping above |
+| NUMBER unconstrained, negative scale | String | No declared p,s to build a decimal from |
+| BINARY_FLOAT | Float32 | IEEE single, not widened |
+| BINARY_DOUBLE | Float64 | |
 | VARCHAR2, CHAR, CLOB, NVARCHAR2, NCHAR, NCLOB | String | |
 | DATE | Timestamp (us, no TZ) | Oracle DATE is wall-clock time |
 | TIMESTAMP | Timestamp (us, no TZ) | |
