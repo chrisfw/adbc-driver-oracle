@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
@@ -530,5 +531,139 @@ func TestIntegration_TzOffsetColumnAppearsInTableSchema(t *testing.T) {
 			t.Errorf("column %d: GetTableSchema says %s %s but ExecuteQuery says %s %s",
 				i, m.Name, m.Type, q.Name, q.Type)
 		}
+	}
+}
+
+// --- INTERVAL ---
+
+// Intervals were String, which reads fine and cannot be computed with. They
+// now arrive as the two Arrow interval types, with the exact values Oracle
+// stored.
+func TestIntegration_Intervals(t *testing.T) {
+	const table = "ADBC_T35_INTERVALS"
+	ctx, cnxn := openTypedConnection(t, nil)
+
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+
+		" (ID NUMBER(10), DS INTERVAL DAY(5) TO SECOND(6), YM INTERVAL YEAR(4) TO MONTH)")
+	defer dropTable(ctx, t, cnxn, table)
+
+	rows := []struct {
+		id       int
+		ds, ym   string
+		wantDS   time.Duration
+		wantMons int32
+	}{
+		{1, "INTERVAL '3 04:05:06.789' DAY TO SECOND", "INTERVAL '7-3' YEAR TO MONTH",
+			3*24*time.Hour + 4*time.Hour + 5*time.Minute + 6*time.Second + 789*time.Millisecond, 7*12 + 3},
+		{2, "INTERVAL '0 00:00:00' DAY TO SECOND", "INTERVAL '0-0' YEAR TO MONTH", 0, 0},
+		{3, "INTERVAL '-3 04:05:06.789' DAY TO SECOND", "INTERVAL '-7-3' YEAR TO MONTH",
+			-(3*24*time.Hour + 4*time.Hour + 5*time.Minute + 6*time.Second + 789*time.Millisecond), -(7*12 + 3)},
+		{4, "INTERVAL '1 00:00:00' DAY TO SECOND", "INTERVAL '0-1' YEAR TO MONTH", 24 * time.Hour, 1},
+	}
+	for _, r := range rows {
+		execUpdate(ctx, t, cnxn, fmt.Sprintf("INSERT INTO %s VALUES (%d, %s, %s)",
+			table, r.id, r.ds, r.ym))
+	}
+	// NULLs have to survive as nulls, not as zero intervals.
+	execUpdate(ctx, t, cnxn, fmt.Sprintf("INSERT INTO %s VALUES (99, NULL, NULL)", table))
+
+	schema, rec := readOneRow(ctx, t, cnxn, `SELECT "DS", "YM" FROM `+table+` ORDER BY "ID"`)
+	defer rec.Release()
+
+	if got, want := schema.Field(0).Type, arrow.FixedWidthTypes.Duration_us; !arrow.TypeEqual(got, want) {
+		t.Fatalf("INTERVAL DAY TO SECOND type = %s, want %s", got, want)
+	}
+	if got, want := schema.Field(1).Type, arrow.FixedWidthTypes.MonthInterval; !arrow.TypeEqual(got, want) {
+		t.Fatalf("INTERVAL YEAR TO MONTH type = %s, want %s", got, want)
+	}
+
+	ds := rec.Column(0).(*array.Duration)
+	ym := rec.Column(1).(*array.MonthInterval)
+	for i, r := range rows {
+		if ds.IsNull(i) {
+			t.Errorf("row %d: DS is null", r.id)
+		} else if got := time.Duration(ds.Value(i)) * time.Microsecond; got != r.wantDS {
+			t.Errorf("row %d: DS = %v, want %v", r.id, got, r.wantDS)
+		}
+		if ym.IsNull(i) {
+			t.Errorf("row %d: YM is null", r.id)
+		} else if got := int32(ym.Value(i)); got != r.wantMons {
+			t.Errorf("row %d: YM = %d months, want %d", r.id, got, r.wantMons)
+		}
+	}
+	last := len(rows)
+	if !ds.IsNull(last) || !ym.IsNull(last) {
+		t.Errorf("NULL row came back as DS=%v YM=%v, want nulls", ds.Value(last), ym.Value(last))
+	}
+}
+
+// An interval stays microseconds even under the nanosecond timestamp unit,
+// because go-ora cannot deliver more than 6 fractional digits. Oracle stores
+// all 9 and TO_CHAR shows all 9; the driver receives ".123456". Pinned so the
+// cap is a recorded limitation rather than a surprise, and so that lifting it
+// in a go-ora fork is a visible decision.
+func TestIntegration_IntervalFractionIsCappedAtMicroseconds(t *testing.T) {
+	const table = "ADBC_T35_INTERVAL_NS"
+	ctx, cnxn := openTypedConnection(t, map[string]string{
+		OptionTimestampUnit: TimestampUnitNano,
+	})
+
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+" (DS INTERVAL DAY(2) TO SECOND(9))")
+	defer dropTable(ctx, t, cnxn, table)
+	// Explicit precision on the literal, or Oracle rounds it to 6 itself.
+	execUpdate(ctx, t, cnxn, "INSERT INTO "+table+
+		" VALUES (INTERVAL '0 00:00:01.123456789' DAY(2) TO SECOND(9))")
+
+	// Oracle really did store all nine digits.
+	if got := querySingleString(ctx, t, cnxn, `SELECT TO_CHAR("DS") FROM `+table); got != "+00 00:00:01.123456789" {
+		t.Fatalf("Oracle stored %q, want the full nine digits", got)
+	}
+
+	schema, rec := readOneRow(ctx, t, cnxn, `SELECT "DS" FROM `+table)
+	defer rec.Release()
+
+	// The unit does not become nanoseconds, since nothing could fill it.
+	if got, want := schema.Field(0).Type, arrow.FixedWidthTypes.Duration_us; !arrow.TypeEqual(got, want) {
+		t.Fatalf("type = %s, want %s even under the nanosecond unit", got, want)
+	}
+	got := time.Duration(rec.Column(0).(*array.Duration).Value(0)) * time.Microsecond
+	want := time.Second + 123456*time.Microsecond
+	if got != want {
+		t.Errorf("got %v, want %v (go-ora renders 6 fractional digits)", got, want)
+	}
+}
+
+// Both schema paths must describe an interval column the same way.
+func TestIntegration_IntervalSchemaPathsAgree(t *testing.T) {
+	ctx, cnxn := openTypedConnection(t, nil)
+
+	ddls := []string{
+		"INTERVAL DAY TO SECOND",
+		"INTERVAL DAY(5) TO SECOND(9)",
+		"INTERVAL YEAR TO MONTH",
+		"INTERVAL YEAR(4) TO MONTH",
+	}
+	for i, ddl := range ddls {
+		table := fmt.Sprintf("ADBC_T35_IVAGREE_%d", i)
+		t.Run(ddl, func(t *testing.T) {
+			dropTable(ctx, t, cnxn, table)
+			execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+" (C "+ddl+")")
+			defer dropTable(ctx, t, cnxn, table)
+
+			meta, err := cnxn.GetTableSchema(ctx, nil, nil, table)
+			if err != nil {
+				t.Fatalf("GetTableSchema: %v", err)
+			}
+			execUpdate(ctx, t, cnxn, "INSERT INTO "+table+" VALUES (NULL)")
+			querySchema, rec := readOneRow(ctx, t, cnxn, "SELECT C FROM "+table)
+			defer rec.Release()
+
+			if !arrow.TypeEqual(meta.Field(0).Type, querySchema.Field(0).Type) {
+				t.Errorf("%s: GetTableSchema says %s but ExecuteQuery says %s",
+					ddl, meta.Field(0).Type, querySchema.Field(0).Type)
+			}
+		})
 	}
 }

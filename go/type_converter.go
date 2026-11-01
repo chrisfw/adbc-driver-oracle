@@ -43,6 +43,10 @@ func appendValue(fieldBuilder array.Builder, val interface{}, ct *sql.ColumnType
 		return appendString(b, val)
 	case *array.TimestampBuilder:
 		return appendTimestamp(b, val)
+	case *array.DurationBuilder:
+		return appendIntervalDS(b, val)
+	case *array.MonthIntervalBuilder:
+		return appendIntervalYM(b, val)
 	case *array.BinaryBuilder:
 		return appendBinary(b, val)
 	case *array.BooleanBuilder:
@@ -227,6 +231,62 @@ func appendTimestamp(b *array.TimestampBuilder, val interface{}) int64 {
 		b.AppendNull()
 	}
 	return 8
+}
+
+// appendIntervalDS fills an INTERVAL DAY TO SECOND column. go-ora decodes the
+// column to Oracle's text form, so the string case is the one that runs.
+func appendIntervalDS(b *array.DurationBuilder, val interface{}) int64 {
+	unit := b.Type().(*arrow.DurationType).Unit
+	switch v := val.(type) {
+	case string:
+		d, ok := parseOracleIntervalDS(v)
+		if !ok {
+			b.AppendNull()
+			return 0
+		}
+		b.Append(arrow.Duration(durationInUnit(d, unit)))
+	case time.Duration:
+		b.Append(arrow.Duration(durationInUnit(v, unit)))
+	default:
+		b.AppendNull()
+	}
+	return 8
+}
+
+// durationInUnit converts a Go duration, which counts nanoseconds, into the
+// column's unit.
+func durationInUnit(d time.Duration, unit arrow.TimeUnit) int64 {
+	switch unit {
+	case arrow.Nanosecond:
+		return int64(d)
+	case arrow.Microsecond:
+		return int64(d / time.Microsecond)
+	case arrow.Millisecond:
+		return int64(d / time.Millisecond)
+	default:
+		return int64(d / time.Second)
+	}
+}
+
+// appendIntervalYM fills an INTERVAL YEAR TO MONTH column as a count of
+// months, which is what Arrow's month_interval carries.
+func appendIntervalYM(b *array.MonthIntervalBuilder, val interface{}) int64 {
+	switch v := val.(type) {
+	case string:
+		months, ok := parseOracleIntervalYM(v)
+		if !ok {
+			b.AppendNull()
+			return 0
+		}
+		b.Append(arrow.MonthInterval(months))
+	case int64:
+		b.Append(arrow.MonthInterval(int32(v)))
+	case int32:
+		b.Append(arrow.MonthInterval(v))
+	default:
+		b.AppendNull()
+	}
+	return 4
 }
 
 func appendBinary(b *array.BinaryBuilder, val interface{}) int64 {

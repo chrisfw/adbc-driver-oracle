@@ -770,6 +770,12 @@ func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, pol 
 	// returns as naive.
 	case strings.HasPrefix(dt, "TIMESTAMP"):
 		return pol.oracleTimestamp(strings.Contains(dt, "TIME ZONE"))
+	// ALL_TAB_COLUMNS spells these "INTERVAL DAY(2) TO SECOND(6)" and
+	// "INTERVAL YEAR(4) TO MONTH".
+	case strings.HasPrefix(dt, "INTERVAL DAY"):
+		return pol.oracleIntervalDS()
+	case strings.HasPrefix(dt, "INTERVAL YEAR"):
+		return arrow.FixedWidthTypes.MonthInterval
 	case strings.HasPrefix(dt, "INTERVAL"):
 		return arrow.BinaryTypes.String
 	case dt == "RAW" || dt == "LONG RAW" || dt == "BLOB":

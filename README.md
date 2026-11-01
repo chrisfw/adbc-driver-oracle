@@ -193,6 +193,27 @@ database zone on the way in and renders it in the session zone on the way out,
 so the original is gone before the driver sees it and the column would only
 repeat the session's own offset.
 
+## Intervals
+
+`INTERVAL YEAR TO MONTH` arrives as Arrow `MonthInterval`, a count of months,
+and `INTERVAL DAY TO SECOND` as `Duration` in microseconds. Both were String
+before, which reads fine and cannot be computed with.
+
+Microseconds rather than nanoseconds is a limit of go-ora, not a choice:
+it decodes an interval to Oracle's text form and renders at most 6 fractional
+digits whatever the column declares. An `INTERVAL DAY(2) TO SECOND(9)` holding
+`.123456789`, which Oracle's own `TO_CHAR` shows in full, reaches the driver as
+`.123456`. `oracle.timestamp_unit=ns` therefore does not apply to intervals,
+since nothing could fill the extra digits.
+
+A duration also spans at most about 106751 days. An `INTERVAL DAY(9) TO SECOND`
+can hold more; values beyond that come back NULL rather than wrapped into a
+wrong number.
+
+Ingest in the other direction does not yet map Arrow `Duration` or
+`MonthInterval` onto Oracle interval columns; those still become
+`VARCHAR2` text.
+
 ## Connections and sessions
 
 Each ADBC connection owns one Oracle session for its whole life, checked out of
@@ -264,8 +285,8 @@ Two Oracle behaviours to know about in transactional mode:
 | TIMESTAMP(p) | Timestamp (us or ns, no TZ) | Unit from `oracle.timestamp_unit` |
 | TIMESTAMP(p) WITH TIME ZONE | Timestamp (us or ns, UTC) | Normalised to UTC |
 | TIMESTAMP(p) WITH LOCAL TIME ZONE | Timestamp (us or ns, UTC) | Normalised to UTC |
-| INTERVAL YEAR TO MONTH | String | e.g. `+03-06` |
-| INTERVAL DAY TO SECOND | String | e.g. `+05 04:03:02.000000` |
+| INTERVAL YEAR TO MONTH | MonthInterval | Count of months |
+| INTERVAL DAY TO SECOND | Duration (us) | go-ora caps the fraction at 6 digits |
 | RAW, BLOB | Binary | |
 | BOOLEAN (Oracle 23c+) | Boolean | |
 | SDO_GEOMETRY | Binary (geoarrow.wkb) | With SRID as PROJJSON CRS |

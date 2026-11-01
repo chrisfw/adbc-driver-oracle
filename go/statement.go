@@ -2103,6 +2103,19 @@ type typePolicy struct {
 	tzOffsetColumn bool
 }
 
+// oracleIntervalDS builds the Arrow type for an INTERVAL DAY TO SECOND.
+//
+// Always microseconds, and deliberately not following oracle.timestamp_unit.
+// go-ora decodes an interval to Oracle's text form and renders at most 6
+// fractional digits whatever the column declares: an INTERVAL DAY(2) TO
+// SECOND(9) holding .123456789, which Oracle's own TO_CHAR shows in full,
+// reaches this driver as ".123456". A nanosecond duration would therefore
+// advertise precision the wire cannot carry, so the unit is fixed at what is
+// actually deliverable.
+func (p typePolicy) oracleIntervalDS() arrow.DataType {
+	return arrow.FixedWidthTypes.Duration_us
+}
+
 // oracleTimestamp builds the Arrow type for an Oracle TIMESTAMP under this
 // policy. zoned covers both WITH TIME ZONE and WITH LOCAL TIME ZONE, which are
 // normalised to UTC on the way out.
@@ -2171,6 +2184,13 @@ func oracleTypeToArrow(ct *sql.ColumnType, pol typePolicy) arrow.DataType {
 		strings.HasPrefix(dbType, "TIMESTAMP"):
 		return pol.oracleTimestamp(true)
 
+	// Intervals were String, which is readable but not arithmetic. go-ora
+	// delivers them as Oracle's text form, which parses exactly into the two
+	// Arrow interval types.
+	case dbType == "INTERVALDS_DTY" || dbType == "INTERVALDS":
+		return pol.oracleIntervalDS()
+	case dbType == "INTERVALYM_DTY" || dbType == "INTERVALYM":
+		return arrow.FixedWidthTypes.MonthInterval
 	case strings.HasPrefix(dbType, "INTERVAL"):
 		return arrow.BinaryTypes.String
 
