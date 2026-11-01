@@ -129,9 +129,12 @@ func NewDriver(alloc memory.Allocator) adbc.Driver {
 			panic(err)
 		}
 	}
-	return driverbase.NewDriver(&driverImpl{
-		DriverImplBase: driverbase.NewDriverImplBase(info, alloc),
-	})
+	base := driverbase.NewDriverImplBase(info, alloc)
+	// Every ErrorHelper in the driver is copied from this one, so installing
+	// the inspector here is what gives Oracle codes and SQLSTATEs to errors
+	// raised anywhere below.
+	base.ErrorHelper.ErrorInspector = oracleErrorInspector{}
+	return driverbase.NewDriver(&driverImpl{DriverImplBase: base})
 }
 
 func (d *driverImpl) NewDatabase(opts map[string]string) (adbc.Database, error) {

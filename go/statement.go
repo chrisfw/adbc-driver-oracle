@@ -18,7 +18,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,7 +35,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	go_ora "github.com/sijms/go-ora/v2"
-	"github.com/sijms/go-ora/v2/network"
 )
 
 type statementImpl struct {
@@ -207,7 +205,7 @@ func (s *statementImpl) preparedStmt(ctx context.Context) (*sql.Stmt, error) {
 	s.closePrepared()
 	stmt, err := sess.PrepareContext(ctx, s.query)
 	if err != nil {
-		return nil, s.ErrorHelper.Errorf(adbc.StatusIO, "prepare failed: %s", err)
+		return nil, s.ErrorHelper.WrapIO(err, "prepare failed")
 	}
 	s.prepared = stmt
 	s.preparedTx = s.cnxn.tx
@@ -261,7 +259,7 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 		rows, err = sess.QueryContext(ctx, s.query, args...)
 	}
 	if err != nil {
-		return nil, -1, s.ErrorHelper.Errorf(adbc.StatusIO, "query execution failed: %s", err)
+		return nil, -1, s.ErrorHelper.WrapIO(err, "query execution failed")
 	}
 
 	impl := &oracleRecordReader{
@@ -308,11 +306,11 @@ func (s *statementImpl) ExecuteUpdate(ctx context.Context) (int64, error) {
 			result, err = sess.ExecContext(ctx, s.query, args...)
 		}
 		if err != nil {
-			return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "execute failed: %s", err)
+			return -1, s.ErrorHelper.WrapIO(err, "execute failed")
 		}
 		affected, err := result.RowsAffected()
 		if err != nil {
-			return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "failed to get rows affected: %s", err)
+			return -1, s.ErrorHelper.WrapIO(err, "failed to get rows affected")
 		}
 		return affected, nil
 	}
@@ -485,7 +483,7 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 				// Only io errors are visible here; end-of-stream is fine
 				// (small streams fit entirely inside the scan window).
 				if err := s.bindStream.Err(); err != nil {
-					return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "bind stream error: %s", err)
+					return -1, s.ErrorHelper.WrapIO(err, "bind stream error")
 				}
 			}
 		}
@@ -652,7 +650,7 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 			return totalRows, firstErr
 		}
 		if err := s.bindStream.Err(); err != nil {
-			return totalRows, s.ErrorHelper.Errorf(adbc.StatusIO, "bind stream error: %s", err)
+			return totalRows, s.ErrorHelper.WrapIO(err, "bind stream error")
 		}
 	} else if s.bindParams != nil {
 		n, err := s.insertBatchParallel(ctx, insertSQL, s.bindParams)
@@ -743,13 +741,13 @@ func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec a
 
 	sess, err := s.cnxn.newIngestSession(ctx)
 	if err != nil {
-		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "get connection failed: %s", err)
+		return 0, s.ErrorHelper.WrapIO(err, "get connection failed")
 	}
 	defer sess.close()
 
 	stmt, err := sess.exec.PrepareContext(ctx, insertSQL)
 	if err != nil {
-		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "prepare insert failed: %s", err)
+		return 0, s.ErrorHelper.WrapIO(err, "prepare insert failed")
 	}
 	defer stmt.Close()
 
@@ -767,11 +765,11 @@ func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec a
 
 	_, err = stmt.ExecContext(ctx, args...)
 	if err != nil {
-		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
+		return 0, s.ErrorHelper.WrapIO(err, "batch insert failed")
 	}
 
 	if err := sess.commit(ctx); err != nil {
-		return int64(numRows), s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
+		return int64(numRows), s.ErrorHelper.WrapIO(err, "commit failed")
 	}
 
 	return int64(numRows), nil
@@ -845,11 +843,11 @@ func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string
 	open := func() error {
 		var err error
 		if sess, err = s.cnxn.newIngestSession(ctx); err != nil {
-			return s.ErrorHelper.Errorf(adbc.StatusIO, "get connection failed: %s", err)
+			return s.ErrorHelper.WrapIO(err, "get connection failed")
 		}
 		if stmt, err = sess.exec.PrepareContext(ctx, insertSQL); err != nil {
 			cleanup()
-			return s.ErrorHelper.Errorf(adbc.StatusIO, "prepare insert failed: %s", err)
+			return s.ErrorHelper.WrapIO(err, "prepare insert failed")
 		}
 		sinceRecycle = 0
 		return nil
@@ -859,7 +857,7 @@ func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string
 			return nil
 		}
 		if err := sess.commit(ctx); err != nil {
-			return s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
+			return s.ErrorHelper.WrapIO(err, "commit failed")
 		}
 		committed += uncommitted
 		uncommitted = 0
@@ -895,12 +893,12 @@ func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string
 			if isOraCode(err, 12899) {
 				// A string wider than the scan window predicted slipped past
 				// the auto sizing; tell the caller how to force CLOB.
-				return committed, s.ErrorHelper.Errorf(adbc.StatusIO,
-					"batch insert failed: %s (hint: value exceeds the column width chosen by the "+
-						"auto type scan — set %s for the affected column, or %s=clob)",
-					err, OptionIngestClobColumns, OptionIngestStringType)
+				return committed, s.ErrorHelper.WrapIO(err,
+					"batch insert failed (hint: value exceeds the column width chosen by the "+
+						"auto type scan, so set %s for the affected column, or %s=clob)",
+					OptionIngestClobColumns, OptionIngestStringType)
 			}
-			return committed, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
+			return committed, s.ErrorHelper.WrapIO(err, "batch insert failed")
 		}
 		uncommitted += int64(pb.nrow)
 		sinceCommit++
@@ -926,13 +924,13 @@ func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string
 func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL string, args []interface{}, numRows int) (int64, error) {
 	sess, err := s.cnxn.newIngestSession(ctx)
 	if err != nil {
-		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "get connection failed: %s", err)
+		return 0, s.ErrorHelper.WrapIO(err, "get connection failed")
 	}
 	defer sess.close()
 
 	stmt, err := sess.exec.PrepareContext(ctx, insertSQL)
 	if err != nil {
-		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "prepare insert failed: %s", err)
+		return 0, s.ErrorHelper.WrapIO(err, "prepare insert failed")
 	}
 	defer stmt.Close()
 
@@ -941,16 +939,16 @@ func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL strin
 		if isOraCode(err, 12899) {
 			// A string wider than the scan window predicted slipped past the
 			// auto sizing; tell the caller how to force CLOB.
-			return 0, s.ErrorHelper.Errorf(adbc.StatusIO,
-				"batch insert failed: %s (hint: value exceeds the column width chosen by the "+
-					"auto type scan — set %s for the affected column, or %s=clob)",
-				err, OptionIngestClobColumns, OptionIngestStringType)
+			return 0, s.ErrorHelper.WrapIO(err,
+				"batch insert failed (hint: value exceeds the column width chosen by the "+
+					"auto type scan, so set %s for the affected column, or %s=clob)",
+				OptionIngestClobColumns, OptionIngestStringType)
 		}
-		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
+		return 0, s.ErrorHelper.WrapIO(err, "batch insert failed")
 	}
 
 	if err := sess.commit(ctx); err != nil {
-		return int64(numRows), s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
+		return int64(numRows), s.ErrorHelper.WrapIO(err, "commit failed")
 	}
 
 	return int64(numRows), nil
@@ -1378,44 +1376,30 @@ func (s *statementImpl) prepareIngestTable(ctx context.Context, tableName string
 		// Create table — fail if exists
 		ddl := buildCreateTableDDL(tableName, schema, colTypes)
 		if _, err := sess.ExecContext(ctx, ddl); err != nil {
-			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
+			return s.ErrorHelper.WrapIO(err, "create table failed")
 		}
 	case adbc.OptionValueIngestModeReplace:
 		// Drop and recreate. A missing table (ORA-00942) is fine; any other
 		// drop failure would surface as a confusing ORA-00955 on the CREATE,
 		// so report it directly.
 		if _, err := sess.ExecContext(ctx, fmt.Sprintf("DROP TABLE %s PURGE", tableName)); err != nil && !isOraCode(err, 942) {
-			return s.ErrorHelper.Errorf(adbc.StatusIO, "drop table failed: %s", err)
+			return s.ErrorHelper.WrapIO(err, "drop table failed")
 		}
 		ddl := buildCreateTableDDL(tableName, schema, colTypes)
 		if _, err := sess.ExecContext(ctx, ddl); err != nil {
-			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
+			return s.ErrorHelper.WrapIO(err, "create table failed")
 		}
 	case adbc.OptionValueIngestModeCreateAppend:
 		// Create if not exists, append if exists. Only ORA-00955 ("name is
 		// already used") means "exists" — anything else is a real failure.
 		ddl := buildCreateTableDDL(tableName, schema, colTypes)
 		if _, err := sess.ExecContext(ctx, ddl); err != nil && !isOraCode(err, 955) {
-			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
+			return s.ErrorHelper.WrapIO(err, "create table failed")
 		}
 	default:
 		return s.ErrorHelper.Errorf(adbc.StatusInvalidArgument, "unknown ingest mode: %s", mode)
 	}
 	return nil
-}
-
-// isOraCode reports whether err carries the given Oracle error code
-// (e.g. 942 for "ORA-00942: table or view does not exist").
-func isOraCode(err error, code int) bool {
-	if err == nil {
-		return false
-	}
-	var oraErr *network.OracleError
-	if errors.As(err, &oraErr) {
-		return oraErr.ErrCode == code
-	}
-	// database/sql can wrap the driver error in plain-text form.
-	return strings.Contains(err.Error(), fmt.Sprintf("ORA-%05d", code))
 }
 
 // isGeometryColumn checks if an Arrow field is a geometry column.

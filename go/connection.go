@@ -112,15 +112,15 @@ func (c *connectionImpl) session(ctx context.Context) (sessionExecutor, error) {
 	// non-default level outright ("only support default value for isolation").
 	tx, err := c.conn.BeginTx(txCtx, nil)
 	if err != nil {
-		return nil, c.ErrorHelper.Errorf(adbc.StatusIO, "failed to begin transaction: %s", err)
+		return nil, c.ErrorHelper.WrapIO(err, "failed to begin transaction")
 	}
 	if c.isolation != "" {
 		// SET TRANSACTION has to be the transaction's first statement, which
 		// is exactly where we are.
 		if _, err := tx.ExecContext(ctx, "SET TRANSACTION ISOLATION LEVEL "+c.isolation); err != nil {
 			_ = tx.Rollback()
-			return nil, c.ErrorHelper.Errorf(adbc.StatusIO,
-				"failed to set isolation level %s: %s", c.isolation, err)
+			return nil, c.ErrorHelper.WrapIO(err,
+				"failed to set isolation level %s", c.isolation)
 		}
 	}
 	c.tx = tx
@@ -152,8 +152,8 @@ func (c *connectionImpl) SetAutocommit(enabled bool) error {
 		return nil
 	}
 	if err := tx.Commit(); err != nil {
-		return c.ErrorHelper.Errorf(adbc.StatusIO,
-			"failed to commit pending transaction while enabling autocommit: %s", err)
+		return c.ErrorHelper.WrapIO(err,
+			"failed to commit pending transaction while enabling autocommit")
 	}
 	return nil
 }
@@ -494,7 +494,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 	} else if s, err := c.GetCurrentDbSchema(); err == nil {
 		schema = s
 	} else {
-		return nil, c.ErrorHelper.Errorf(adbc.StatusIO, "GetTableSchema: cannot resolve current schema: %s", err)
+		return nil, c.ErrorHelper.WrapIO(err, "GetTableSchema: cannot resolve current schema")
 	}
 
 	query := `SELECT COLUMN_NAME, DATA_TYPE, NULLABLE, DATA_PRECISION, DATA_SCALE
@@ -505,7 +505,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 	}
 	rows, err := sess.QueryContext(ctx, query, schema, strings.ToUpper(tableName))
 	if err != nil {
-		return nil, c.ErrorHelper.Errorf(adbc.StatusIO, "GetTableSchema: %s", err)
+		return nil, c.ErrorHelper.WrapIO(err, "GetTableSchema")
 	}
 	defer rows.Close()
 
@@ -589,7 +589,7 @@ func (c *connectionImpl) SetCurrentDbSchema(schema string) error {
 	// same string is one (nonexistent) identifier and fails with ORA-01435.
 	if _, err := sess.ExecContext(ctx,
 		"ALTER SESSION SET CURRENT_SCHEMA = "+quoteOracleIdentifier(ident)); err != nil {
-		return c.ErrorHelper.Errorf(adbc.StatusIO, "failed to set schema to %q: %s", ident, err)
+		return c.ErrorHelper.WrapIO(err, "failed to set schema to %q", ident)
 	}
 	return nil
 }
@@ -657,7 +657,7 @@ func (c *connectionImpl) Commit(ctx context.Context) error {
 		return nil
 	}
 	if err := tx.Commit(); err != nil {
-		return c.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
+		return c.ErrorHelper.WrapIO(err, "commit failed")
 	}
 	return nil
 }
@@ -668,7 +668,7 @@ func (c *connectionImpl) Rollback(ctx context.Context) error {
 		return nil
 	}
 	if err := tx.Rollback(); err != nil {
-		return c.ErrorHelper.Errorf(adbc.StatusIO, "rollback failed: %s", err)
+		return c.ErrorHelper.WrapIO(err, "rollback failed")
 	}
 	return nil
 }
@@ -685,7 +685,7 @@ func (c *connectionImpl) Close() error {
 	var firstErr error
 	if tx := c.takeTx(); tx != nil {
 		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			firstErr = c.ErrorHelper.Errorf(adbc.StatusIO, "rollback on close failed: %s", err)
+			firstErr = c.ErrorHelper.WrapIO(err, "rollback on close failed")
 		}
 	}
 	if c.txCancel != nil {

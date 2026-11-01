@@ -246,7 +246,7 @@ func (db *databaseImpl) getPool(ctx context.Context) (*sql.DB, error) {
 func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 	pool, err := db.getPool(ctx)
 	if err != nil {
-		return nil, db.ErrorHelper.Errorf(adbc.StatusIO, "%s", err)
+		return nil, db.ErrorHelper.WrapIO(err, "failed to open Oracle database")
 	}
 
 	// Check one session out of the pool and keep it for this connection's
@@ -256,7 +256,7 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 	// free. The pool stays on databaseImpl purely as the session factory.
 	conn, err := pool.Conn(ctx)
 	if err != nil {
-		return nil, db.ErrorHelper.Errorf(adbc.StatusIO, "failed to open Oracle session: %s", err)
+		return nil, db.ErrorHelper.WrapIO(err, "failed to open Oracle session")
 	}
 
 	cnxnBase := driverbase.NewConnectionImplBase(&db.DatabaseImplBase)

@@ -69,6 +69,40 @@ reader, _, _ := stmt.ExecuteQuery(ctx)
 // reader is an Arrow RecordReader with geoarrow.wkb geometry columns
 ```
 
+## Errors
+
+Failures carry the Oracle error code in `adbc.Error.VendorCode` and a SQL:2003
+SQLSTATE in `adbc.Error.SqlState`, alongside the ADBC status. The SQLSTATE is
+what ODBC and JDBC consumers switch on, so it is the more portable signal:
+
+| Oracle | SQLSTATE | ADBC status |
+|--------|----------|-------------|
+| ORA-00001, ORA-02290 | 23000 | Integrity |
+| ORA-01400 | 23502 | Integrity |
+| ORA-02291, ORA-02292 | 23503 | Integrity |
+| ORA-00942 | 42S02 | Not Found |
+| ORA-00904 | 42S22 | Not Found |
+| ORA-00955 | 42S01 | Already Exists |
+| ORA-01017 | 28000 | Unauthenticated |
+| ORA-01031, ORA-01045 | 42000 | Unauthorized |
+| ORA-01013 | HY008 | Cancelled |
+| ORA-12899 | 22001 | Invalid Data |
+| ORA-01438 | 22003 | Invalid Data |
+| ORA-01722 | 22018 | Invalid Data |
+| ORA-01858, ORA-01861 | 22007 | Invalid Data |
+| ORA-00060, ORA-08177 | 40001 | Internal |
+| ORA-12000 to ORA-12999 | 08001 | I/O |
+| ORA-00028, ORA-031xx | 08S01 | I/O |
+| anything else | HY000 | unchanged |
+
+ORA-00060 and ORA-08177 mean the transaction should be retried. ADBC has no
+retryable status, so SQLSTATE 40001 is the signal to act on rather than the
+status.
+
+A context deadline maps to Timeout, a cancelled context to Cancelled, and a
+transport failure with no Oracle code to 08S01. Those carry no vendor code,
+since Oracle never saw them.
+
 ## Connections and sessions
 
 Each ADBC connection owns one Oracle session for its whole life, checked out of
