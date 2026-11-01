@@ -16,6 +16,7 @@ package oracle
 
 import (
 	"context"
+	"errors"
 	"runtime/debug"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -69,6 +70,62 @@ const (
 	// while sizing string columns (default 64 MiB).
 	OptionIngestTypeScanLimit = "oracle.ingest.type_scan_limit_bytes"
 
+	// number_scan_rows is how many rows are sampled to infer an Arrow type
+	// for an Oracle NUMBER declared without precision and scale (default
+	// 1024; 0 disables inference and such columns stay text).
+	//
+	// No Arrow decimal can hold a column whose scale varies per value, which
+	// is what an unconstrained NUMBER is, so the alternative to sampling is
+	// text. See number_infer.go for why the sample cannot be made a promise
+	// and why precision is taken at the maximum rather than fitted.
+	OptionNumberScanRows = "oracle.number_scan_rows"
+
+	// number_overflow is what happens when a value does not fit the type
+	// inferred from the sample: "error" (default) fails the read naming the
+	// column and value, "null" nulls that value and logs once.
+	//
+	// There is deliberately no option to round into the inferred scale. A
+	// rounded value looks right and is wrong, which is a worse failure than
+	// either of these.
+	OptionNumberOverflow = "oracle.number_overflow"
+
+	// opaque_number, when "true", labels an unconstrained NUMBER that could
+	// not be inferred as the canonical arrow.opaque extension over utf8,
+	// instead of as a plain utf8 column. The label records that the column is
+	// an Oracle NUMBER rather than ordinary text.
+	//
+	// Off by default, and this one is not as additive as it looks. Across the
+	// C data interface an unknown extension does degrade to its storage type,
+	// but to an in-process Arrow consumer the concrete array becomes an
+	// extension array rather than a String array, and arrow-go's
+	// ExtensionArrayBase.ValueStr panics outright. Anything doing generic
+	// value extraction breaks. Turn this on when the consumer is known to
+	// handle extension types.
+	OptionOpaqueNumber = "oracle.opaque_number"
+
+	// compact_decimals, when "true", narrows a declared NUMBER(p,s) to the
+	// smallest Arrow decimal that holds it: Decimal32 to 9 digits, Decimal64
+	// to 18, Decimal128 beyond. Four bytes a value instead of sixteen for a
+	// NUMBER(4,2), which matters on a read-bound driver.
+	//
+	// Off by default because it is an interop risk, not a free win. The C
+	// data interface spells a non-128 decimal as "d:<precision>,<scale>,<bits>"
+	// and a consumer that only parses 128-bit decimals rejects it. Turn this
+	// on when the consumer is known to handle Decimal32 and Decimal64.
+	OptionCompactDecimals = "oracle.compact_decimals"
+
+	// timestamp_with_offset, when "true", carries a TIMESTAMP WITH TIME ZONE
+	// as the canonical arrow.timestamp_with_offset extension, a
+	// Struct{timestamp: Timestamp(T,"UTC"), offset_minutes: Int16}, instead of
+	// as a UTC timestamp beside the "<col>__tz" String column that
+	// oracle.tz_offset_column emits.
+	//
+	// Off by default, and the same interop caution applies: it is a standard
+	// type but a recent one, so a consumer that does not know the extension
+	// sees the raw struct rather than a timestamp. Supersedes
+	// oracle.tz_offset_column when both are set.
+	OptionTimestampWithOffset = "oracle.timestamp_with_offset"
+
 	// prefetch_rows is how many rows Oracle returns per fetch round trip
 	// (default 10000).
 	//
@@ -112,6 +169,11 @@ const (
 	OptionNumberMapping = "oracle.number_mapping"
 
 	DefaultPort = "1521"
+
+	// defaultNumberScanRows is what an unset oracle.number_scan_rows means.
+	// Large enough that a column of ordinary values settles on its true
+	// scale, small enough that the peek is not itself a cost.
+	defaultNumberScanRows = 1024
 
 	// defaultPrefetchRows is what an unset oracle.prefetch_rows means. It was
 	// the hard-coded value before the option existed, and measurement put it
@@ -187,6 +249,20 @@ func oracleLobFetchParam(val string) (string, bool) {
 	}
 	return "", false
 }
+
+// Accepted values for OptionNumberOverflow.
+const (
+	// NumberOverflowError fails the read when a value does not fit the
+	// inferred decimal, naming the column and the value.
+	NumberOverflowError = "error"
+
+	// NumberOverflowNull nulls the value and logs once, so a long extract
+	// completes instead of dying on one outlier.
+	NumberOverflowNull = "null"
+
+	// defaultNumberOverflow is what an unset oracle.number_overflow means.
+	defaultNumberOverflow = NumberOverflowError
+)
 
 // Accepted values for OptionTimestampUnit.
 //
@@ -281,6 +357,9 @@ func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string
 		port:             DefaultPort,
 		poolSize:         8,
 		ingestWorkers:    1,
+		// Negative marks oracle.number_scan_rows unset, since a configured 0
+		// means "do not infer" and must survive.
+		numberScanRows: -1,
 	}
 
 	if err := db.SetOptions(opts); err != nil {
@@ -289,3 +368,24 @@ func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string
 
 	return driverbase.NewDatabase(db), nil
 }
+
+// parseBoolOption reads an ADBC boolean option value.
+func parseBoolOption(val string) (bool, error) {
+	switch val {
+	case adbc.OptionValueEnabled:
+		return true, nil
+	case adbc.OptionValueDisabled:
+		return false, nil
+	}
+	return false, errInvalidBoolOption
+}
+
+// boolOptionValue renders a bool back as the canonical ADBC option value.
+func boolOptionValue(b bool) string {
+	if b {
+		return adbc.OptionValueEnabled
+	}
+	return adbc.OptionValueDisabled
+}
+
+var errInvalidBoolOption = errors.New("expected true or false")

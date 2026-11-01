@@ -205,15 +205,19 @@ func TestIntegration_TypeMapping(t *testing.T) {
 	// Verify types. DATE and TIMESTAMP carry no zone in Oracle, so they map to
 	// tz-naive Arrow timestamps (wall clock); SYSTIMESTAMP is TSTZ → tz=UTC.
 	//
-	// The two numbers are String, which is worth being explicit about. Oracle
-	// reports a literal or a computed expression as NUMBER with a floating
-	// scale rather than a declared one, and the default decimal mapping has no
-	// precision and scale to build a Decimal128 from, so it keeps the value
-	// lossless as text instead of rounding it into a float. The same applies
-	// to COUNT(*), SUM() and any arithmetic. Callers who want numbers out of
-	// expressions either CAST in SQL or set oracle.number_mapping=float, which
-	// the subtest below checks still works.
-	expected := []string{"utf8", "utf8", "utf8", "timestamp[us]", "timestamp[us, tz=UTC]", "binary"}
+	// The two numbers are decimals, with the scale taken from the data.
+	// Oracle reports a literal or a computed expression as NUMBER with a
+	// floating scale rather than a declared one, so there is nothing in the
+	// metadata to build a decimal from and these columns used to arrive as
+	// text. oracle.number_scan_rows samples the result and types them from
+	// the digits actually present: 42 has no fraction so it lands at scale 0,
+	// 3.14 at scale 2. The same now applies to COUNT(*), SUM() and
+	// arithmetic. Precision is the type maximum rather than a fit, so a later
+	// row has room; see number_infer.go.
+	expected := []string{
+		"decimal(38, 0)", "decimal(38, 2)", "utf8",
+		"timestamp[us]", "timestamp[us, tz=UTC]", "binary",
+	}
 	for i, f := range schema.Fields() {
 		got := f.Type.String()
 		if got != expected[i] {

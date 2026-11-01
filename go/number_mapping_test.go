@@ -178,8 +178,10 @@ func TestDefaultNumberMappingIsDecimal(t *testing.T) {
 		{"NUMBER(10) stays the cheaper int64", 10, 0, arrow.PrimitiveTypes.Int64},
 		{"NUMBER(38,0) is exact, not text", 38, 0, decimal128(38, 0)},
 		// Unconstrained NUMBER has no declared precision to build a decimal
-		// from, so it stays lossless as text rather than becoming a float.
-		{"unconstrained NUMBER stays lossless", 0, oracleScaleSentinel, arrow.BinaryTypes.String},
+		// from. Without a sample to infer one it stays lossless as text, but
+		// labelled arrow.opaque so the column says it is an Oracle NUMBER
+		// rather than passing as an ordinary string.
+		{"unconstrained NUMBER stays lossless text", 0, oracleScaleSentinel, arrow.BinaryTypes.String},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -237,5 +239,67 @@ func TestAppendValue_Decimal128(t *testing.T) {
 	// converter must not append a second one.
 	if !arr.IsNull(5) {
 		t.Error("unparseable string should append null")
+	}
+}
+
+// The opaque label must be additive: its storage is still utf8, so a consumer
+// that does not know the extension sees exactly what it saw before. If that
+// stopped being true, turning the label on would be a breaking change rather
+// than extra information.
+func TestOpaqueNumberTypeDegradesToUtf8(t *testing.T) {
+	dt := opaqueNumberType()
+	ext, ok := dt.(arrow.ExtensionType)
+	if !ok {
+		t.Fatalf("opaqueNumberType() is %T, want an arrow.ExtensionType", dt)
+	}
+	if got := ext.ExtensionName(); got != "arrow.opaque" {
+		t.Errorf("extension name = %q, want arrow.opaque", got)
+	}
+	if !arrow.TypeEqual(ext.StorageType(), arrow.BinaryTypes.String) {
+		t.Errorf("storage type = %s, want utf8", ext.StorageType())
+	}
+}
+
+// Under the string mapping the caller asked for text, so they get plain text
+// rather than a label implying the driver gave up on something.
+func TestStringMappingStaysPlainText(t *testing.T) {
+	got := numberToArrow(0, oracleScaleSentinel, true, NumberMappingString)
+	if !arrow.TypeEqual(got, arrow.BinaryTypes.String) {
+		t.Errorf("string mapping = %s, want plain utf8", got)
+	}
+}
+
+// numberNeedsInference decides whether sampling rows could help. It must say
+// no for anything that already has a usable type, or a sample would be taken
+// for nothing.
+func TestNumberNeedsInference(t *testing.T) {
+	dec := typePolicy{numberMapping: NumberMappingDecimal}
+	cases := []struct {
+		name             string
+		precision, scale int64
+		ok               bool
+		pol              typePolicy
+		want             bool
+	}{
+		{"unconstrained under decimal", 0, oracleScaleSentinel, true, dec, true},
+		{"sentinel with precision", 38, oracleScaleSentinel, true, dec, true},
+		{"negative declared scale", 5, 256 - 2, true, dec, true},
+		{"no decimal size at all", 0, 0, false, dec, true},
+		{"unset mapping behaves as decimal", 0, oracleScaleSentinel, true, typePolicy{}, true},
+
+		{"NUMBER(10) is already Int64", 10, 0, true, dec, false},
+		{"NUMBER(12,2) is already a decimal", 12, 2, true, dec, false},
+		{"NUMBER(38,0) is already a decimal", 38, 0, true, dec, false},
+		{"float mapping has its own answer", 0, oracleScaleSentinel, true,
+			typePolicy{numberMapping: NumberMappingFloat}, false},
+		{"string mapping asked for text", 0, oracleScaleSentinel, true,
+			typePolicy{numberMapping: NumberMappingString}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := numberNeedsInference(tc.precision, tc.scale, tc.ok, tc.pol); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

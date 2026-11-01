@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -75,6 +76,25 @@ type connectionImpl struct {
 	// OptionTzOffsetColumn.
 	tzOffsetColumn bool
 
+	// numberScanRows samples rows to infer a type for unconstrained NUMBER;
+	// 0 disables it. See OptionNumberScanRows.
+	numberScanRows int
+
+	// numberOverflow is the policy for a value that does not fit the inferred
+	// decimal. See OptionNumberOverflow.
+	numberOverflow string
+
+	// compactDecimals narrows declared NUMBER to Decimal32/64 where it fits.
+	compactDecimals bool
+
+	// timestampWithOffset carries TIMESTAMP WITH TIME ZONE as the canonical
+	// arrow extension rather than as a UTC timestamp plus a sibling column.
+	timestampWithOffset bool
+
+	// opaqueNumber labels an uninferred NUMBER as arrow.opaque. See
+	// OptionOpaqueNumber.
+	opaqueNumber bool
+
 	varcharOnce  sync.Once
 	varcharLimit int // cached inline VARCHAR2 byte cap; see inlineStringLimit
 }
@@ -83,9 +103,14 @@ type connectionImpl struct {
 // paths must use.
 func (c *connectionImpl) typePolicy() typePolicy {
 	return typePolicy{
-		numberMapping:  c.numberMapping,
-		timestampUnit:  c.timestampUnit,
-		tzOffsetColumn: c.tzOffsetColumn,
+		numberMapping:       c.numberMapping,
+		timestampUnit:       c.timestampUnit,
+		tzOffsetColumn:      c.tzOffsetColumn,
+		numberScanRows:      c.numberScanRows,
+		numberOverflow:      c.numberOverflow,
+		compactDecimals:     c.compactDecimals,
+		timestampWithOffset: c.timestampWithOffset,
+		opaqueNumber:        c.opaqueNumber,
 	}
 }
 
@@ -528,6 +553,9 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 	defer rows.Close()
 
 	var fields []arrow.Field
+	// Columns whose type has to come from data rather than from the
+	// dictionary, resolved after this loop so the cursor is free.
+	var inferNumber []string
 	for rows.Next() {
 		var (
 			name     string
@@ -541,9 +569,18 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 		}
 
 		pol := c.typePolicy()
+		colType := oracleDataTypeToArrow(dataType, prec, scale, pol)
+		// An unconstrained NUMBER gets its type from the data in the query
+		// path, so the dictionary has to sample too or the two schemas
+		// describe the same column differently, which is the defect 2.1
+		// exists to prevent.
+		if p, s, ok := decimalSizeFromMetadata(prec, scale); numberNeedsInference(p, s, ok, pol) &&
+			strings.ToUpper(dataType) == "NUMBER" {
+			inferNumber = append(inferNumber, name)
+		}
 		fields = append(fields, arrow.Field{
 			Name:     name,
-			Type:     oracleDataTypeToArrow(dataType, prec, scale, pol),
+			Type:     colType,
 			Nullable: nullable == "Y",
 		})
 		// The sibling zone column has to appear here too, or this schema
@@ -563,7 +600,85 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 		return nil, c.ErrorHelper.Errorf(adbc.StatusNotFound, "table %s.%s not found", schema, tableName)
 	}
 
+	if len(inferNumber) > 0 {
+		c.inferTableNumberTypes(ctx, schema, tableName, inferNumber, fields)
+	}
+
 	return arrow.NewSchema(fields, nil), nil
+}
+
+// inferTableNumberTypes samples the table to type the unconstrained NUMBER
+// columns the dictionary could not, updating fields in place.
+//
+// This is what keeps GetTableSchema agreeing with ExecuteQuery: the query path
+// samples the result, so the metadata path samples the table. A failure here
+// is not fatal, since the columns already hold the text fallback, which is
+// what the query path also falls back to.
+func (c *connectionImpl) inferTableNumberTypes(ctx context.Context, schema, tableName string, cols []string, fields []arrow.Field) {
+	n := c.numberScanRows
+	if n < 1 {
+		return
+	}
+
+	quoted := make([]string, len(cols))
+	for i, name := range cols {
+		quoted[i] = quoteOracleIdentifier(name)
+	}
+	query := "SELECT " + strings.Join(quoted, ", ") +
+		" FROM " + quoteOracleIdentifier(schema) + "." + quoteOracleIdentifier(strings.ToUpper(tableName)) +
+		" WHERE ROWNUM <= " + strconv.Itoa(n)
+
+	sess, err := c.session(ctx)
+	if err != nil {
+		return
+	}
+	rows, err := sess.QueryContext(ctx, query)
+	if err != nil {
+		// No SELECT on the table, or it is a view that cannot be sampled.
+		// The text fallback already in fields stands.
+		return
+	}
+	defer rows.Close()
+
+	digits := make([]numberDigits, len(cols))
+	dest := make([]interface{}, len(cols))
+	vals := make([]interface{}, len(cols))
+	for i := range dest {
+		dest[i] = &vals[i]
+	}
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return
+		}
+		for i := range cols {
+			switch v := vals[i].(type) {
+			case string:
+				digits[i].observe(v)
+			case []byte:
+				digits[i].observe(string(v))
+			case nil:
+			default:
+				digits[i].unparseable = true
+			}
+		}
+	}
+	if rows.Err() != nil {
+		return
+	}
+
+	byName := make(map[string]int, len(cols))
+	for i, name := range cols {
+		byName[name] = i
+	}
+	for fi := range fields {
+		i, ok := byName[fields[fi].Name]
+		if !ok {
+			continue
+		}
+		if dt := inferredNumberType(digits[i]); dt != nil {
+			fields[fi].Type = dt
+		}
+	}
 }
 
 // --- Namespace: CurrentNamespacer ---

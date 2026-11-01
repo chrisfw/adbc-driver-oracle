@@ -31,6 +31,12 @@ func appendValue(fieldBuilder array.Builder, val interface{}, ct *sql.ColumnType
 	}
 
 	switch b := fieldBuilder.(type) {
+	// An extension column's builder wraps the storage builder, and the type
+	// switch below matches concrete storage builders, so without this the
+	// arrow.opaque label applied to an unconstrained NUMBER would null every
+	// value in the column. Unwrap and let the storage type decide.
+	case *array.ExtensionBuilder:
+		return appendValue(b.StorageBuilder(), val, ct)
 	case *array.Int64Builder:
 		return appendInt64(b, val)
 	case *array.Float32Builder:
@@ -39,6 +45,17 @@ func appendValue(fieldBuilder array.Builder, val interface{}, ct *sql.ColumnType
 		return appendFloat64(b, val)
 	case *array.Decimal128Builder:
 		return appendDecimal128(b, val)
+	// The other three decimal widths reach this switch too: Decimal32 and
+	// Decimal64 when oracle.compact_decimals narrows a declared NUMBER, and
+	// Decimal256 when a sampled type needed more than 38 digits. Without a
+	// case each they would fall to the default below and be appended as
+	// nulls, so every value in the column would silently vanish.
+	case *array.Decimal32Builder:
+		return appendDecimalViaString(b, val, 4)
+	case *array.Decimal64Builder:
+		return appendDecimalViaString(b, val, 8)
+	case *array.Decimal256Builder:
+		return appendDecimalViaString(b, val, 32)
 	case *array.StringBuilder:
 		return appendString(b, val)
 	case *array.LargeStringBuilder:
@@ -190,6 +207,42 @@ func appendDecimal128(b *array.Decimal128Builder, val interface{}) int64 {
 		b.AppendNull()
 	}
 	return 16
+}
+
+// decimalStringAppender is the part of the decimal builders this needs: all
+// four widths share baseDecimalBuilder, so one helper serves them.
+type decimalStringAppender interface {
+	AppendValueFromString(string) error
+	AppendNull()
+}
+
+// appendDecimalViaString fills any decimal builder from Oracle's rendered
+// text. Only Decimal128 has a hand-written fast path, because that is the
+// width a profile showed mattered; the rest are correct rather than fast, and
+// if one of them ever shows up in a profile it can get the same treatment.
+//
+// AppendValueFromString appends a null itself when parsing fails, so a failure
+// must not append again.
+func appendDecimalViaString(b decimalStringAppender, val interface{}, width int64) int64 {
+	switch v := val.(type) {
+	case string:
+		_ = b.AppendValueFromString(v)
+	case []byte:
+		_ = b.AppendValueFromString(string(v))
+	case int64:
+		_ = b.AppendValueFromString(strconv.FormatInt(v, 10))
+	case int32:
+		_ = b.AppendValueFromString(strconv.FormatInt(int64(v), 10))
+	case int:
+		_ = b.AppendValueFromString(strconv.FormatInt(int64(v), 10))
+	case float64:
+		_ = b.AppendValueFromString(strconv.FormatFloat(v, 'f', -1, 64))
+	case float32:
+		_ = b.AppendValueFromString(strconv.FormatFloat(float64(v), 'f', -1, 32))
+	default:
+		b.AppendNull()
+	}
+	return width
 }
 
 func appendString(b *array.StringBuilder, val interface{}) int64 {

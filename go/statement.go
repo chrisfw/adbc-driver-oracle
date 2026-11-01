@@ -289,6 +289,7 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 		rows:      rows,
 		policy:    s.cnxn.typePolicy(),
 		batchRows: readerBatchRows,
+		logger:    s.cnxn.Logger,
 	}
 
 	var rr driverbase.BaseRecordReader
@@ -1856,6 +1857,10 @@ const (
 	outputValue outputKind = iota
 	outputGeometry
 	outputZone
+	// outputInferredDecimal is a NUMBER whose type came from sampling rather
+	// than from a declaration, so a later value may not fit it and the
+	// overflow policy applies.
+	outputInferredDecimal
 )
 
 // outputField links one emitted Arrow column to the Oracle column it reads.
@@ -1876,11 +1881,48 @@ type oracleRecordReader struct {
 	scanDest    []interface{}
 	scanVals    []interface{}
 	geomIndices []int
-	firstRow    []interface{}
-	hasFirstRow bool
+
+	// peeked holds rows read before the schema could be declared, and
+	// peekPos how many of them AppendRows has replayed. Both the geometry
+	// SRID and the inferred NUMBER types need to look at data before naming
+	// a type, and those rows still have to reach the consumer.
+	peeked  [][]interface{}
+	peekPos int
 
 	// policy is the connection's resolved type-mapping configuration.
 	policy typePolicy
+
+	// overflowErr is set when a value did not fit an inferred decimal and
+	// the policy is to fail. AppendRows returns it rather than appending.
+	overflowErr error
+
+	// overflowLogged keeps the warning for a nulled value to one per read
+	// instead of one per value.
+	overflowLogged bool
+
+	// logger is used for the overflow warning. May be nil.
+	logger *slog.Logger
+}
+
+// peekRows reads up to n more rows into the peek buffer, stopping early at end
+// of data. Returns how many rows the buffer holds.
+func (r *oracleRecordReader) peekRows(n int) int {
+	width := len(r.colTypes)
+	for len(r.peeked) < n {
+		if !r.rows.Next() {
+			break
+		}
+		dest := make([]interface{}, width)
+		vals := make([]interface{}, width)
+		for i := range dest {
+			dest[i] = &vals[i]
+		}
+		if err := r.rows.Scan(dest...); err != nil {
+			break
+		}
+		r.peeked = append(r.peeked, vals)
+	}
+	return len(r.peeked)
 }
 
 func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.RecordBatch, rowIdx int) (*arrow.Schema, error) {
@@ -1902,10 +1944,67 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 		}
 	}
 
-	// If there are geometry columns, peek at the first row to get the SRID
+	// Decide which NUMBER columns have no declared precision and scale, so a
+	// type has to come from the data instead.
+	inferring := make(map[int]bool)
+	if n := r.policy.numberScanRows; n > 0 {
+		for i, ct := range colTypes {
+			if strings.ToUpper(ct.DatabaseTypeName()) != "NUMBER" {
+				continue
+			}
+			p, s, ok := ct.DecimalSize()
+			if numberNeedsInference(p, s, ok, r.policy) {
+				inferring[i] = true
+			}
+		}
+	}
+
+	// Both the geometry SRID and the inferred types need to see data before a
+	// type can be named, so take one sample that serves both. The rows are
+	// buffered and replayed, so nothing is consumed from the caller.
+	sample := 0
+	if len(r.geomIndices) > 0 {
+		sample = 1
+	}
+	if len(inferring) > 0 && r.policy.numberScanRows > sample {
+		sample = r.policy.numberScanRows
+	}
+	if sample > 0 {
+		r.peekRows(sample)
+	}
+
 	var srid int64
 	if len(r.geomIndices) > 0 {
 		srid = r.peekSRID()
+	}
+
+	// Fold the sample into digit counts per inferred column.
+	inferred := make(map[int]arrow.DataType, len(inferring))
+	if len(inferring) > 0 {
+		digits := make(map[int]*numberDigits, len(inferring))
+		for i := range inferring {
+			digits[i] = &numberDigits{}
+		}
+		for _, vals := range r.peeked {
+			for i, d := range digits {
+				switch v := vals[i].(type) {
+				case string:
+					d.observe(v)
+				case []byte:
+					d.observe(string(v))
+				case nil:
+					// A null says nothing about the scale.
+				default:
+					// Not the decimal text this relies on.
+					d.unparseable = true
+				}
+			}
+		}
+		for i, d := range digits {
+			if dt := inferredNumberType(*d); dt != nil {
+				inferred[i] = dt
+			}
+		}
 	}
 
 	// Build the emitted schema. It is not always one Arrow column per Oracle
@@ -1929,12 +2028,18 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 			continue
 		}
 
+		colType := oracleTypeToArrow(ct, r.policy)
+		kind := outputValue
+		if dt, ok := inferred[i]; ok {
+			colType = dt
+			kind = outputInferredDecimal
+		}
 		fields = append(fields, arrow.Field{
 			Name:     ct.Name(),
-			Type:     oracleTypeToArrow(ct, r.policy),
+			Type:     colType,
 			Nullable: nullable,
 		})
-		r.outputs = append(r.outputs, outputField{col: i, kind: outputValue})
+		r.outputs = append(r.outputs, outputField{col: i, kind: kind})
 
 		if r.policy.tzOffsetColumn && hasRecoverableZone(ct.DatabaseTypeName()) {
 			fields = append(fields, arrow.Field{
@@ -1996,12 +2101,16 @@ func (r *oracleRecordReader) AppendRows(builder *array.RecordBuilder) (int64, in
 		target = 1
 	}
 
+	if r.overflowErr != nil {
+		return 0, 0, r.overflowErr
+	}
+
 	for rows < target {
-		if r.hasFirstRow {
-			// The SRID peek in NextResultSet consumed a row; replay it.
-			r.hasFirstRow = false
-			copy(r.scanVals, r.firstRow)
-			r.firstRow = nil
+		if r.peekPos < len(r.peeked) {
+			// NextResultSet read these before it could name the types.
+			copy(r.scanVals, r.peeked[r.peekPos])
+			r.peeked[r.peekPos] = nil
+			r.peekPos++
 		} else {
 			if !r.rows.Next() {
 				if err := r.rows.Err(); err != nil {
@@ -2025,6 +2134,13 @@ func (r *oracleRecordReader) AppendRows(builder *array.RecordBuilder) (int64, in
 				rowSize += r.appendGeometry(builder.Field(field), val)
 			case outputZone:
 				rowSize += appendZone(builder.Field(field), val)
+			case outputInferredDecimal:
+				size, err := r.appendInferredDecimal(builder.Field(field), val, r.colTypes[o.col].Name())
+				if err != nil {
+					r.overflowErr = err
+					return rows, rowSize, err
+				}
+				rowSize += size
 			default:
 				rowSize += appendValue(builder.Field(field), val, r.colTypes[o.col])
 			}
@@ -2076,28 +2192,15 @@ func (r *oracleRecordReader) appendGeometry(fieldBuilder array.Builder, val inte
 	return int64(len(wkb))
 }
 
+// peekSRID finds the SRID of the first geometry value in the peek buffer.
+// Reads from the buffer rather than consuming a row of its own, so it can
+// share the sample that NUMBER inference also needs.
 func (r *oracleRecordReader) peekSRID() int64 {
-	if !r.rows.Next() {
-		return 0
-	}
-
-	n := len(r.colTypes)
-	dest := make([]interface{}, n)
-	vals := make([]interface{}, n)
-	for i := range dest {
-		dest[i] = &vals[i]
-	}
-
-	if err := r.rows.Scan(dest...); err != nil {
-		return 0
-	}
-
-	r.firstRow = vals
-	r.hasFirstRow = true
-
-	for _, idx := range r.geomIndices {
-		if geom, ok := vals[idx].(SdoGeometry); ok && geom.SRID != 0 {
-			return geom.SRID
+	for _, vals := range r.peeked {
+		for _, idx := range r.geomIndices {
+			if geom, ok := vals[idx].(SdoGeometry); ok && geom.SRID != 0 {
+				return geom.SRID
+			}
 		}
 	}
 	return 0
@@ -2138,6 +2241,26 @@ type typePolicy struct {
 	// WITH TIME ZONE, carrying the zone the value arrived in. See
 	// OptionTzOffsetColumn.
 	tzOffsetColumn bool
+
+	// opaqueNumber labels an uninferred NUMBER as arrow.opaque rather than
+	// leaving it plain utf8. See OptionOpaqueNumber.
+	opaqueNumber bool
+
+	// numberScanRows samples rows to infer a type for unconstrained NUMBER;
+	// 0 disables it and such columns stay text. See OptionNumberScanRows.
+	numberScanRows int
+
+	// numberOverflow is the policy for a value that does not fit the inferred
+	// decimal. See OptionNumberOverflow.
+	numberOverflow string
+
+	// compactDecimals narrows declared NUMBER to Decimal32/64 where it fits.
+	// See OptionCompactDecimals.
+	compactDecimals bool
+
+	// timestampWithOffset carries TIMESTAMP WITH TIME ZONE as the canonical
+	// arrow.timestamp_with_offset extension. See OptionTimestampWithOffset.
+	timestampWithOffset bool
 }
 
 // oracleIntervalDS builds the Arrow type for an INTERVAL DAY TO SECOND.
@@ -2260,6 +2383,17 @@ func oracleTypeToArrow(ct *sql.ColumnType, pol typePolicy) arrow.DataType {
 // configured mapping policy. precision, scale and ok are as reported by
 // sql.ColumnType.DecimalSize. See the NumberMapping* constants.
 func numberToArrow(precision, scale int64, ok bool, numberMapping string) arrow.DataType {
+	return numberToArrowWith(precision, scale, ok, typePolicy{numberMapping: numberMapping})
+}
+
+// numberToArrowWith is numberToArrow under a full policy, so compact decimals
+// and the opaque label are decided in the one place both schema paths share.
+//
+// An unconstrained NUMBER returns nil rather than a type: only the caller
+// knows whether it can sample rows to infer one, so the decision of what to do
+// instead belongs there. numberFallbackType gives the answer when it cannot.
+func numberToArrowWith(precision, scale int64, ok bool, pol typePolicy) arrow.DataType {
+	numberMapping := pol.numberMapping
 	if numberMapping == "" {
 		// Reached when a reader was built without a resolved policy. Keep it
 		// identical to the resolved default rather than quietly differing.
@@ -2277,12 +2411,18 @@ func numberToArrow(precision, scale int64, ok bool, numberMapping string) arrow.
 
 	if numberMapping == NumberMappingDecimal {
 		if dt := numberDecimalType(precision, scale, ok); dt != nil {
+			if pol.compactDecimals {
+				if dec, isDec := dt.(arrow.DecimalType); isDec {
+					return compactDecimalType(dec.GetPrecision(), dec.GetScale())
+				}
+			}
 			return dt
 		}
-		// Not representable as Decimal128 — unconstrained NUMBER, a negative
-		// declared scale, or precision beyond 38. Prefer the lossless String
-		// over silently truncating into a float.
-		return arrow.BinaryTypes.String
+		// No declared precision and scale to build a decimal from: an
+		// unconstrained NUMBER, a negative declared scale, or precision past
+		// 38. Callers that can sample rows ask numberNeedsInference first and
+		// use what they infer; this is the answer when they cannot.
+		return numberFallbackType(pol)
 	}
 
 	// NumberMappingFloat: the upstream driver's historical behaviour.
@@ -2290,6 +2430,44 @@ func numberToArrow(precision, scale int64, ok bool, numberMapping string) arrow.
 		return arrow.BinaryTypes.String
 	}
 	return arrow.PrimitiveTypes.Float64
+}
+
+// numberNeedsInference reports whether a NUMBER column has no declared
+// precision and scale to build a decimal from, so a type could instead be
+// inferred by sampling rows.
+//
+// True only under the decimal mapping: float already has a numeric answer for
+// such a column and string was asked for text, so neither has anything to gain
+// from a sample.
+func numberNeedsInference(precision, scale int64, ok bool, pol typePolicy) bool {
+	mapping := pol.numberMapping
+	if mapping == "" {
+		mapping = defaultNumberMapping
+	}
+	if mapping != NumberMappingDecimal {
+		return false
+	}
+	if ok && scale == 0 && precision > 0 && precision <= 18 {
+		// Already Int64, which is exact and narrower than any decimal.
+		return false
+	}
+	return numberDecimalType(precision, scale, ok) == nil
+}
+
+// numberFallbackType is what an unconstrained NUMBER becomes when no type can
+// be inferred from data: text, but labelled.
+//
+// arrow.opaque is the canonical extension for a value from an external system
+// that could not be interpreted, which is what this is. It does not make the
+// column a number, but it stops the column claiming to be an ordinary string
+// when it is really an Oracle NUMBER that Arrow has no type for. Consumers
+// that do not know the extension see its utf8 storage.
+func numberFallbackType(pol typePolicy) arrow.DataType {
+	if pol.opaqueNumber && pol.numberMapping != NumberMappingString {
+		// Opt-in only: see OptionOpaqueNumber for why the label is not free.
+		return opaqueNumberType()
+	}
+	return arrow.BinaryTypes.String
 }
 
 // numberDecimalType returns the Decimal128 type for a declared precision and

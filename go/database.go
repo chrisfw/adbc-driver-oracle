@@ -68,6 +68,26 @@ type databaseImpl struct {
 	// defaultPrefetchRows. See OptionPrefetchRows.
 	prefetchRows int
 
+	// numberScanRows samples rows to infer a type for unconstrained NUMBER.
+	// Negative means unset; 0 disables inference. See OptionNumberScanRows.
+	numberScanRows int
+
+	// numberOverflow is the policy for a value that does not fit the inferred
+	// decimal. Empty means defaultNumberOverflow. See OptionNumberOverflow.
+	numberOverflow string
+
+	// compactDecimals narrows declared NUMBER to Decimal32/64 where it fits.
+	// See OptionCompactDecimals.
+	compactDecimals bool
+
+	// timestampWithOffset carries TIMESTAMP WITH TIME ZONE as the canonical
+	// arrow extension. See OptionTimestampWithOffset.
+	timestampWithOffset bool
+
+	// opaqueNumber labels an uninferred NUMBER as arrow.opaque. See
+	// OptionOpaqueNumber.
+	opaqueNumber bool
+
 	// Connection pool — shared across all Open() calls.
 	// sql.DB is already a pool internally; we create it once and reuse.
 	pool     *sql.DB
@@ -113,6 +133,47 @@ func (db *databaseImpl) SetOption(key string, val string) error {
 				OptionNumberMapping, val,
 				NumberMappingFloat, NumberMappingDecimal, NumberMappingString)
 		}
+	case OptionNumberScanRows:
+		n, err := strconv.Atoi(val)
+		if err != nil || n < 0 {
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected a non-negative integer (0 disables inference)",
+				OptionNumberScanRows, val)
+		}
+		db.numberScanRows = n
+	case OptionNumberOverflow:
+		switch val {
+		case NumberOverflowError, NumberOverflowNull:
+			db.numberOverflow = val
+		default:
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected %q or %q",
+				OptionNumberOverflow, val, NumberOverflowError, NumberOverflowNull)
+		}
+	case OptionOpaqueNumber:
+		b, err := parseBoolOption(val)
+		if err != nil {
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected %q or %q",
+				OptionOpaqueNumber, val, adbc.OptionValueEnabled, adbc.OptionValueDisabled)
+		}
+		db.opaqueNumber = b
+	case OptionCompactDecimals:
+		b, err := parseBoolOption(val)
+		if err != nil {
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected %q or %q",
+				OptionCompactDecimals, val, adbc.OptionValueEnabled, adbc.OptionValueDisabled)
+		}
+		db.compactDecimals = b
+	case OptionTimestampWithOffset:
+		b, err := parseBoolOption(val)
+		if err != nil {
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected %q or %q",
+				OptionTimestampWithOffset, val, adbc.OptionValueEnabled, adbc.OptionValueDisabled)
+		}
+		db.timestampWithOffset = b
 	case OptionPrefetchRows:
 		n, err := strconv.Atoi(val)
 		if err != nil || n < 1 {
@@ -183,6 +244,19 @@ func (db *databaseImpl) GetOption(key string) (string, error) {
 		return db.lobFetch, nil
 	case OptionPrefetchRows:
 		return strconv.Itoa(db.effectivePrefetchRows()), nil
+	case OptionNumberScanRows:
+		return strconv.Itoa(db.effectiveNumberScanRows()), nil
+	case OptionNumberOverflow:
+		if db.numberOverflow == "" {
+			return defaultNumberOverflow, nil
+		}
+		return db.numberOverflow, nil
+	case OptionCompactDecimals:
+		return boolOptionValue(db.compactDecimals), nil
+	case OptionOpaqueNumber:
+		return boolOptionValue(db.opaqueNumber), nil
+	case OptionTimestampWithOffset:
+		return boolOptionValue(db.timestampWithOffset), nil
 	case OptionTzOffsetColumn:
 		if db.tzOffsetColumn {
 			return adbc.OptionValueEnabled, nil
@@ -207,6 +281,24 @@ func (db *databaseImpl) effectiveNumberMapping() string {
 func (db *databaseImpl) effectiveArrowTimeUnit() arrow.TimeUnit {
 	unit, _ := arrowTimeUnit(db.timestampUnit)
 	return unit
+}
+
+// effectiveNumberScanRows resolves the unset value to the default. A
+// configured 0 is meaningful and means "do not infer", so unset is tracked as
+// a negative rather than as zero.
+func (db *databaseImpl) effectiveNumberScanRows() int {
+	if db.numberScanRows < 0 {
+		return defaultNumberScanRows
+	}
+	return db.numberScanRows
+}
+
+// effectiveNumberOverflow resolves the unset value to the default.
+func (db *databaseImpl) effectiveNumberOverflow() string {
+	if db.numberOverflow == "" {
+		return defaultNumberOverflow
+	}
+	return db.numberOverflow
 }
 
 // effectivePrefetchRows resolves the unset value to the default.
@@ -366,6 +458,12 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		numberMapping:      db.effectiveNumberMapping(),
 		timestampUnit:      db.effectiveArrowTimeUnit(),
 		tzOffsetColumn:     db.tzOffsetColumn,
+
+		numberScanRows:      db.effectiveNumberScanRows(),
+		numberOverflow:      db.effectiveNumberOverflow(),
+		compactDecimals:     db.compactDecimals,
+		timestampWithOffset: db.timestampWithOffset,
+		opaqueNumber:        db.opaqueNumber,
 	}
 	// Transactions are begun with a context scoped to the connection, not to
 	// the statement that happens to start one: database/sql rolls a
