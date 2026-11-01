@@ -17,6 +17,7 @@ package oracle
 import (
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -376,12 +377,40 @@ func TestStringColumnExtendedVarcharAvoidsClob(t *testing.T) {
 
 	schema := arrow.NewSchema([]arrow.Field{{Name: "tags", Type: arrow.BinaryTypes.String}}, nil)
 	widths := []int{5000}
-	if got := resolveColumnTypes(schema, widths, "", nil, maxExtendedStringBytes); got[0] != "VARCHAR2(32767)" {
-		t.Errorf("EXTENDED DDL: got %q, want VARCHAR2(32767)", got[0])
+	// The declared width comes from varcharDeclWidth, so assert the property
+	// that matters (inline VARCHAR2 wide enough for the data) rather than the
+	// exact number, which moves whenever the headroom or bucket size is tuned.
+	got := resolveColumnTypes(schema, widths, "", nil, maxExtendedStringBytes)[0]
+	decl, ok := parseVarcharWidth(got)
+	switch {
+	case !ok:
+		t.Errorf("EXTENDED DDL: got %q, want a VARCHAR2(n)", got)
+	case decl < 5000:
+		t.Errorf("EXTENDED DDL: got %q, too narrow for the 5000-byte value", got)
+	case decl > maxExtendedStringBytes:
+		t.Errorf("EXTENDED DDL: got %q, exceeds the EXTENDED cap %d", got, maxExtendedStringBytes)
 	}
 	if got := resolveColumnTypes(schema, widths, "", nil, maxInlineStringBytes); got[0] != "CLOB" {
 		t.Errorf("STANDARD DDL: got %q, want CLOB", got[0])
 	}
+}
+
+// parseVarcharWidth returns the declared byte width of a "VARCHAR2(n)" DDL
+// type, and whether the type was a VARCHAR2 at all.
+func parseVarcharWidth(ddl string) (int, bool) {
+	rest, ok := strings.CutPrefix(ddl, "VARCHAR2(")
+	if !ok {
+		return 0, false
+	}
+	digits, ok := strings.CutSuffix(rest, ")")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // Strings and binaries must be deep-copied: the pipeline path converts a
