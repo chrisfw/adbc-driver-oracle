@@ -267,11 +267,17 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		ingestWorkers:      db.ingestWorkers,
 		numberMapping:      db.effectiveNumberMapping(),
 	}
+	// Transactions are begun with a context scoped to the connection, not to
+	// the statement that happens to start one: database/sql rolls a
+	// transaction back when its context is cancelled. Close cancels this.
+	// Deliberately not derived from ctx, which only covers this Open call.
+	cnxn.txCtx, cnxn.txCancel = context.WithCancel(context.Background())
 
 	return driverbase.NewConnectionBuilder(cnxn).
 		WithDbObjectsEnumerator(cnxn).
 		WithTableTypeLister(cnxn).
 		WithCurrentNamespacer(cnxn).
+		WithAutocommitSetter(cnxn).
 		Connection(), nil
 }
 

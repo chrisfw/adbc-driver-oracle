@@ -23,7 +23,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -74,22 +76,17 @@ func TestIngestConcurrency(t *testing.T) {
 
 // --- Unit: ingest sessions only commit and close what they own ---
 
-// With autocommit off the worker must be handed the connection's own session,
-// untouched by the pool. This is the core of 1.1: no ingest worker may slip
-// onto a second Oracle session and commit outside the caller's transaction.
-func TestNewIngestSessionInTransactionUsesOwnedSession(t *testing.T) {
-	pool, log := newStubPool(t)
-
-	owned, err := pool.Conn(context.Background())
-	if err != nil {
-		t.Fatalf("checkout owned session: %v", err)
-	}
-	defer owned.Close()
-
-	c := &connectionImpl{db: pool, conn: owned}
+// With autocommit off the worker must join the caller's transaction on the
+// connection's own session, never take one from the pool. This is the core of
+// 1.1 and 1.2 together: no ingest worker may slip onto a second Oracle session
+// and commit outside the transaction the caller opened.
+func TestNewIngestSessionInTransactionJoinsTransaction(t *testing.T) {
+	ctx := context.Background()
+	c, _, log := newStubConnection(t)
 	c.Autocommit = false
+	defer closeStubConnection(t, c)
 
-	sess, err := c.newIngestSession(context.Background())
+	sess, err := c.newIngestSession(ctx)
 	if err != nil {
 		t.Fatalf("newIngestSession: %v", err)
 	}
@@ -99,33 +96,36 @@ func TestNewIngestSessionInTransactionUsesOwnedSession(t *testing.T) {
 	if sess.conn != nil {
 		t.Error("captured a pool connection while in a transaction")
 	}
-	if sess.exec != sessionExecutor(owned) {
-		t.Error("did not run on the connection's owned session")
+	if c.tx == nil {
+		t.Fatal("no transaction was begun")
+	}
+	if sess.exec != sessionExecutor(c.tx) {
+		t.Error("ingest did not run inside the caller's transaction")
 	}
 
 	// Committing here would end the caller's transaction behind its back.
 	log.reset()
-	if err := sess.commit(context.Background()); err != nil {
-		t.Errorf("commit on an owned session: got %v, want nil", err)
+	if err := sess.commit(ctx); err != nil {
+		t.Errorf("commit on a transaction-bound session: got %v, want nil", err)
 	}
 	if got := log.statements(); len(got) != 0 {
-		t.Errorf("owned session issued %v, want no statements", got)
+		t.Errorf("transaction-bound session issued %v, want no statements", got)
 	}
 
-	// Closing must leave the connection's session alive for the next batch
-	// and for the caller's eventual Commit.
+	// Closing must leave the transaction open for the next batch and for the
+	// caller's eventual Commit.
 	sess.close()
-	if err := owned.PingContext(context.Background()); err != nil {
-		t.Errorf("owned session unusable after ingest close: %v", err)
+	if c.tx == nil {
+		t.Error("ingest close ended the caller's transaction")
 	}
 }
 
 // With autocommit on the worker gets a session of its own, commits on it, and
 // hands it back. That is what makes parallel ingest safe and fast.
 func TestNewIngestSessionAutocommitUsesPooledSession(t *testing.T) {
-	pool, log := newStubPool(t)
-	c := &connectionImpl{db: pool}
+	c, _, log := newStubConnection(t)
 	c.Autocommit = true
+	defer closeStubConnection(t, c)
 
 	sess, err := c.newIngestSession(context.Background())
 	if err != nil {
@@ -498,6 +498,40 @@ var (
 	// tests do not run in parallel, so the shared log stays deterministic.
 	stubSharedLog = &stubLog{}
 )
+
+// newStubConnection builds a connectionImpl over the stub driver, wired the
+// way databaseImpl.Open wires a real one: its own session out of the pool and
+// a connection-scoped transaction context.
+func newStubConnection(t *testing.T) (*connectionImpl, *sql.DB, *stubLog) {
+	t.Helper()
+	pool, log := newStubPool(t)
+	owned, err := pool.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("checkout owned session: %v", err)
+	}
+	c := &connectionImpl{db: pool, conn: owned}
+	c.ErrorHelper = driverbase.ErrorHelper{DriverName: "stub"}
+	c.Autocommit = true
+	c.txCtx, c.txCancel = context.WithCancel(context.Background())
+	return c, pool, log
+}
+
+// closeStubConnection closes through connectionImpl.Close, which is where the
+// open-transaction rollback lives. Calling owned.Close() directly instead
+// would block forever on any test that left a transaction open.
+func closeStubConnection(t *testing.T, c *connectionImpl) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- c.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close blocked: an open transaction was not resolved before returning the session")
+	}
+}
 
 // newStubPool returns a *sql.DB backed by the stub driver, plus the log of
 // statements run against it.

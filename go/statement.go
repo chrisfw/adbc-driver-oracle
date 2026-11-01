@@ -153,7 +153,14 @@ func (s *statementImpl) Prepare(ctx context.Context) error {
 		return s.ErrorHelper.Errorf(adbc.StatusInvalidState, "no query set")
 	}
 	s.closePrepared()
-	stmt, err := s.cnxn.session().PrepareContext(ctx, s.query)
+	// Preparing on the open transaction when there is one: a *sql.Stmt is
+	// bound to whatever began it, and one prepared on the bare session would
+	// execute outside the caller's transaction.
+	sess, err := s.cnxn.session(ctx)
+	if err != nil {
+		return err
+	}
+	stmt, err := sess.PrepareContext(ctx, s.query)
 	if err != nil {
 		return s.ErrorHelper.Errorf(adbc.StatusIO, "prepare failed: %s", err)
 	}
@@ -196,7 +203,11 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 	if s.prepared != nil {
 		rows, err = s.prepared.QueryContext(ctx, args...)
 	} else {
-		rows, err = s.cnxn.session().QueryContext(ctx, s.query, args...)
+		sess, sessErr := s.cnxn.session(ctx)
+		if sessErr != nil {
+			return nil, -1, sessErr
+		}
+		rows, err = sess.QueryContext(ctx, s.query, args...)
 	}
 	if err != nil {
 		return nil, -1, s.ErrorHelper.Errorf(adbc.StatusIO, "query execution failed: %s", err)
@@ -235,7 +246,11 @@ func (s *statementImpl) ExecuteUpdate(ctx context.Context) (int64, error) {
 		if s.prepared != nil {
 			result, err = s.prepared.ExecContext(ctx, args...)
 		} else {
-			result, err = s.cnxn.session().ExecContext(ctx, s.query, args...)
+			sess, sessErr := s.cnxn.session(ctx)
+			if sessErr != nil {
+				return -1, sessErr
+			}
+			result, err = sess.ExecContext(ctx, s.query, args...)
 		}
 		if err != nil {
 			return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "execute failed: %s", err)
@@ -458,9 +473,20 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	// Note: APPEND_VALUES hint is not compatible with go-ora's array binding protocol
 	// (Oracle interprets al8i4[1]>1 as batch execution, triggering ORA-38910).
 	// NOLOGGING alone still reduces redo I/O for conventional inserts.
-	s.cnxn.session().ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s NOLOGGING", tableName))
-	// Restore logging on every exit path, not just success.
-	defer s.cnxn.session().ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s LOGGING", tableName))
+	//
+	// Only with autocommit on. ALTER TABLE is DDL, and Oracle commits
+	// implicitly around DDL, so the restoring ALTER would commit the rows this
+	// ingest just inserted and the caller's Rollback would find nothing to
+	// undo. Giving up a redo optimisation is the right trade against silently
+	// breaking transactional ingest.
+	if s.cnxn.Autocommit {
+		// Best-effort tuning: ignore failures, including a session we cannot get.
+		if sess, err := s.cnxn.session(ctx); err == nil {
+			sess.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s NOLOGGING", tableName))
+			// Restore logging on every exit path, not just success.
+			defer sess.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s LOGGING", tableName))
+		}
+	}
 
 	var totalRows int64
 
@@ -1129,32 +1155,44 @@ func wkbColumnToSdoSliceRange(arr arrow.Array, start, end int, srid int64) inter
 	return vals
 }
 
+// prepareIngestTable runs the ingest DDL on the connection's session.
+//
+// Oracle commits implicitly around DDL, so with autocommit off a CREATE or
+// DROP here also commits whatever the caller had pending. That is Oracle's
+// behaviour rather than this driver's, and append mode is the way to avoid it.
 func (s *statementImpl) prepareIngestTable(ctx context.Context, tableName string, schema *arrow.Schema, mode string, colTypes []string) error {
+	if mode == adbc.OptionValueIngestModeAppend {
+		// Table must exist, so there is no DDL and no session is needed.
+		return nil
+	}
+	sess, err := s.cnxn.session(ctx)
+	if err != nil {
+		return err
+	}
+
 	switch mode {
 	case adbc.OptionValueIngestModeCreate:
 		// Create table — fail if exists
 		ddl := buildCreateTableDDL(tableName, schema, colTypes)
-		if _, err := s.cnxn.session().ExecContext(ctx, ddl); err != nil {
+		if _, err := sess.ExecContext(ctx, ddl); err != nil {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
 		}
-	case adbc.OptionValueIngestModeAppend:
-		// Table must exist — do nothing
 	case adbc.OptionValueIngestModeReplace:
 		// Drop and recreate. A missing table (ORA-00942) is fine; any other
 		// drop failure would surface as a confusing ORA-00955 on the CREATE,
 		// so report it directly.
-		if _, err := s.cnxn.session().ExecContext(ctx, fmt.Sprintf("DROP TABLE %s PURGE", tableName)); err != nil && !isOraCode(err, 942) {
+		if _, err := sess.ExecContext(ctx, fmt.Sprintf("DROP TABLE %s PURGE", tableName)); err != nil && !isOraCode(err, 942) {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "drop table failed: %s", err)
 		}
 		ddl := buildCreateTableDDL(tableName, schema, colTypes)
-		if _, err := s.cnxn.session().ExecContext(ctx, ddl); err != nil {
+		if _, err := sess.ExecContext(ctx, ddl); err != nil {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
 		}
 	case adbc.OptionValueIngestModeCreateAppend:
 		// Create if not exists, append if exists. Only ORA-00955 ("name is
 		// already used") means "exists" — anything else is a real failure.
 		ddl := buildCreateTableDDL(tableName, schema, colTypes)
-		if _, err := s.cnxn.session().ExecContext(ctx, ddl); err != nil && !isOraCode(err, 955) {
+		if _, err := sess.ExecContext(ctx, ddl); err != nil && !isOraCode(err, 955) {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
 		}
 	default:

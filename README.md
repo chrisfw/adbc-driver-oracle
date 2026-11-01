@@ -88,6 +88,38 @@ autocommit off the rows must land in the caller's transaction, so ingest runs
 serially on the connection's own session and the caller's `Commit` decides the
 outcome.
 
+## Transactions
+
+Autocommit is on by default, as the ADBC spec requires. In that mode go-ora
+sets Oracle's commit-on-success flag on every DML execute, so each statement
+commits itself and `Commit`/`Rollback` return `StatusInvalidState`.
+
+Setting `adbc.connection.autocommit` to `false` makes the connection
+transactional. The transaction begins at the next statement on the connection's
+own session, every later statement joins it, and `Commit` or `Rollback` ends
+it; the statement after that begins a fresh one. Switching autocommit back on
+commits whatever is pending. Closing a connection with an open transaction
+discards the uncommitted work.
+
+`adbc.connection.transaction.isolation_level` accepts `read_committed` (the
+Oracle default) and `serializable`. The other ADBC levels have no Oracle
+equivalent and are refused with `StatusNotImplemented` rather than silently
+downgraded. The level applies to the next transaction begun, not to one already
+open, since Oracle's `SET TRANSACTION` only works as a transaction's first
+statement.
+
+Two Oracle behaviours to know about in transactional mode:
+
+- **DDL commits implicitly.** `CREATE TABLE` and `DROP TABLE` in Oracle commit
+  before and after themselves, so an ingest in `create` or `replace` mode also
+  commits whatever the caller had pending. Use `append` against a pre-existing
+  table to keep an ingest fully inside your transaction.
+- **Bulk ingest runs serially.** With autocommit on, each ingest worker inserts
+  and commits on a session of its own. With autocommit off the rows must land
+  in the caller's transaction and only the connection's own session is in it,
+  so `oracle.ingest_workers` is ignored and the redo-log `NOLOGGING`
+  optimisation is skipped (it is DDL, and would commit the rows).
+
 ## Supported Oracle Types
 
 | Oracle Type | Arrow Type | Notes |

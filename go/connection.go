@@ -17,6 +17,7 @@ package oracle
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"sync"
 
@@ -40,6 +41,25 @@ type connectionImpl struct {
 	// CURRENT_SCHEMA and transactions mean anything on this connection.
 	conn *sql.Conn
 
+	// tx is the open transaction, or nil. Only ever non-nil with autocommit
+	// off, where session() begins it at the first statement and Commit,
+	// Rollback or Close ends it.
+	tx *sql.Tx
+
+	// txCtx is the context transactions are begun with, and txCancel ends it.
+	// It must outlive any single statement: database/sql rolls a transaction
+	// back when the context it was begun with is cancelled, so beginning one
+	// with a statement's context would kill the transaction as soon as that
+	// statement's caller moved on. Close cancels it, which also stops the
+	// goroutine database/sql starts per transaction to watch for that.
+	txCtx    context.Context
+	txCancel context.CancelFunc
+
+	// isolation is the Oracle isolation level clause applied to each
+	// transaction this connection begins, or "" for the server default.
+	// Set through adbc.OptionKeyIsolationLevel.
+	isolation string
+
 	ingestWorkers int // parallel insert workers (from database config)
 
 	// numberMapping is the NUMBER→Arrow policy for result sets, resolved to a
@@ -61,13 +81,142 @@ type sessionExecutor interface {
 	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
 }
 
-// session returns the executor this connection's work runs on: its owned
-// Oracle session.
+// session returns the executor this connection's work must run on.
 //
-// After Close the returned *sql.Conn is spent rather than nil, so a statement
+// With autocommit on that is the owned session directly: go-ora sets the TTC
+// commit-on-success flag on every DML execute, so each statement commits
+// itself and no transaction is involved.
+//
+// With autocommit off the first caller here begins a transaction on the owned
+// session and every later statement joins it, until Commit or Rollback ends
+// it; the statement after that begins a fresh one. go-ora's Begin is local
+// state (it only clears the commit-on-success flag), so this costs no round
+// trip beyond the isolation level when one is set.
+//
+// After Close the owned *sql.Conn is spent rather than nil, so a statement
 // used past its connection reports sql.ErrConnDone instead of panicking.
-func (c *connectionImpl) session() sessionExecutor {
-	return c.conn
+func (c *connectionImpl) session(ctx context.Context) (sessionExecutor, error) {
+	if c.Autocommit {
+		return c.conn, nil
+	}
+	if c.tx != nil {
+		return c.tx, nil
+	}
+
+	txCtx := c.txCtx
+	if txCtx == nil {
+		txCtx = context.Background()
+	}
+	// Isolation goes in as SQL, not TxOptions: go-ora's BeginTx rejects any
+	// non-default level outright ("only support default value for isolation").
+	tx, err := c.conn.BeginTx(txCtx, nil)
+	if err != nil {
+		return nil, c.ErrorHelper.Errorf(adbc.StatusIO, "failed to begin transaction: %s", err)
+	}
+	if c.isolation != "" {
+		// SET TRANSACTION has to be the transaction's first statement, which
+		// is exactly where we are.
+		if _, err := tx.ExecContext(ctx, "SET TRANSACTION ISOLATION LEVEL "+c.isolation); err != nil {
+			_ = tx.Rollback()
+			return nil, c.ErrorHelper.Errorf(adbc.StatusIO,
+				"failed to set isolation level %s: %s", c.isolation, err)
+		}
+	}
+	c.tx = tx
+	return c.tx, nil
+}
+
+// takeTx detaches the open transaction so a caller can end it exactly once.
+func (c *connectionImpl) takeTx() *sql.Tx {
+	tx := c.tx
+	c.tx = nil
+	return tx
+}
+
+// SetAutocommit implements driverbase.AutocommitSetter. driverbase routes
+// adbc.OptionKeyAutoCommit here and records the new state only when this
+// returns nil.
+func (c *connectionImpl) SetAutocommit(enabled bool) error {
+	if enabled == c.Autocommit {
+		return nil
+	}
+	if !enabled {
+		// Turning autocommit off only arms session(); the transaction begins
+		// at the next statement, so there is nothing here that can fail.
+		return nil
+	}
+	// ADBC requires enabling autocommit to commit whatever is pending.
+	tx := c.takeTx()
+	if tx == nil {
+		return nil
+	}
+	if err := tx.Commit(); err != nil {
+		return c.ErrorHelper.Errorf(adbc.StatusIO,
+			"failed to commit pending transaction while enabling autocommit: %s", err)
+	}
+	return nil
+}
+
+// SetOption handles the connection options this driver owns. driverbase has
+// already dealt with autocommit, catalog and schema by the time a key reaches
+// here.
+func (c *connectionImpl) SetOption(key, val string) error {
+	switch key {
+	case adbc.OptionKeyIsolationLevel:
+		clause, ok := oracleIsolationClause(val)
+		if !ok {
+			return c.ErrorHelper.Errorf(adbc.StatusNotImplemented,
+				"unsupported %s %q: Oracle offers read_committed and serializable",
+				adbc.OptionKeyIsolationLevel, val)
+		}
+		// Applied when the next transaction begins; an open one keeps the
+		// level it started with, since SET TRANSACTION only works first.
+		c.isolation = clause
+		return nil
+	default:
+		return c.ConnectionImplBase.SetOption(key, val)
+	}
+}
+
+func (c *connectionImpl) GetOption(key string) (string, error) {
+	switch key {
+	case adbc.OptionKeyIsolationLevel:
+		switch c.isolation {
+		case isolationReadCommitted:
+			return string(adbc.LevelReadCommitted), nil
+		case isolationSerializable:
+			return string(adbc.LevelSerializable), nil
+		default:
+			return string(adbc.LevelDefault), nil
+		}
+	default:
+		return c.ConnectionImplBase.GetOption(key)
+	}
+}
+
+// Oracle implements exactly two of the SQL isolation levels: READ COMMITTED
+// (its default) and SERIALIZABLE. READ ONLY exists too but is not an ADBC
+// level. Anything else has no Oracle equivalent and must be refused rather
+// than silently downgraded.
+const (
+	isolationReadCommitted = "READ COMMITTED"
+	isolationSerializable  = "SERIALIZABLE"
+)
+
+// oracleIsolationClause maps an ADBC isolation level to its Oracle SET
+// TRANSACTION clause. It accepts the canonical ADBC option values and the
+// bare short names, since callers reach for both.
+func oracleIsolationClause(val string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case string(adbc.LevelDefault), "default", "":
+		return "", true
+	case string(adbc.LevelReadCommitted), "read_committed":
+		return isolationReadCommitted, true
+	case string(adbc.LevelSerializable), "serializable":
+		return isolationSerializable, true
+	default:
+		return "", false
+	}
 }
 
 // ingestSession is the session one ingest worker inserts on.
@@ -94,7 +243,13 @@ type ingestSession struct {
 
 func (c *connectionImpl) newIngestSession(ctx context.Context) (*ingestSession, error) {
 	if !c.Autocommit {
-		return &ingestSession{exec: c.session()}, nil
+		// Join the caller's transaction rather than take a session that would
+		// commit outside it.
+		exec, err := c.session(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &ingestSession{exec: exec}, nil
 	}
 	conn, err := c.db.Conn(ctx)
 	if err != nil {
@@ -153,8 +308,12 @@ func (c *connectionImpl) ingestConcurrency(requested int) int {
 func (c *connectionImpl) inlineStringLimit(ctx context.Context) int {
 	c.varcharOnce.Do(func() {
 		c.varcharLimit = maxInlineStringBytes
+		sess, err := c.session(ctx)
+		if err != nil {
+			return
+		}
 		var v string
-		if err := c.session().QueryRowContext(ctx,
+		if err := sess.QueryRowContext(ctx,
 			"SELECT value FROM v$parameter WHERE name = 'max_string_size'").Scan(&v); err == nil {
 			if strings.EqualFold(strings.TrimSpace(v), "EXTENDED") {
 				c.varcharLimit = maxExtendedStringBytes
@@ -179,8 +338,11 @@ func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
 func (c *connectionImpl) GetCatalogs(ctx context.Context, catalogFilter *string) ([]string, error) {
 	// Oracle doesn't have catalogs in the same way. Return the current database name.
 	var name string
-	err := c.session().QueryRowContext(ctx, "SELECT ORA_DATABASE_NAME FROM DUAL").Scan(&name)
+	sess, err := c.session(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := sess.QueryRowContext(ctx, "SELECT ORA_DATABASE_NAME FROM DUAL").Scan(&name); err != nil {
 		return nil, err
 	}
 	if catalogFilter != nil && !matchLike(name, *catalogFilter) {
@@ -191,7 +353,11 @@ func (c *connectionImpl) GetCatalogs(ctx context.Context, catalogFilter *string)
 
 func (c *connectionImpl) GetDBSchemasForCatalog(ctx context.Context, catalog string, schemaFilter *string) ([]string, error) {
 	query := "SELECT USERNAME FROM ALL_USERS ORDER BY USERNAME"
-	rows, err := c.session().QueryContext(ctx, query)
+	sess, err := c.session(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := sess.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +384,11 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 		SELECT VIEW_NAME, 'VIEW' AS TABLE_TYPE FROM ALL_VIEWS WHERE OWNER = :2
 	) ORDER BY TABLE_NAME`
 
-	rows, err := c.session().QueryContext(ctx, query, strings.ToUpper(schema), strings.ToUpper(schema))
+	sess, err := c.session(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := sess.QueryContext(ctx, query, strings.ToUpper(schema), strings.ToUpper(schema))
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +425,11 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 func (c *connectionImpl) getColumnsForTable(ctx context.Context, schema, table string, columnFilter *string) ([]driverbase.ColumnInfo, error) {
 	query := `SELECT COLUMN_NAME, COLUMN_ID, DATA_TYPE, NULLABLE, DATA_DEFAULT, DATA_PRECISION, DATA_SCALE
 		FROM ALL_TAB_COLUMNS WHERE OWNER = :1 AND TABLE_NAME = :2 ORDER BY COLUMN_ID`
-	rows, err := c.session().QueryContext(ctx, query, strings.ToUpper(schema), strings.ToUpper(table))
+	sess, err := c.session(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := sess.QueryContext(ctx, query, strings.ToUpper(schema), strings.ToUpper(table))
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +498,11 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 
 	query := `SELECT COLUMN_NAME, DATA_TYPE, NULLABLE, DATA_PRECISION, DATA_SCALE
 		FROM ALL_TAB_COLUMNS WHERE OWNER = :1 AND TABLE_NAME = :2 ORDER BY COLUMN_ID`
-	rows, err := c.session().QueryContext(ctx, query, schema, strings.ToUpper(tableName))
+	sess, err := c.session(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := sess.QueryContext(ctx, query, schema, strings.ToUpper(tableName))
 	if err != nil {
 		return nil, c.ErrorHelper.Errorf(adbc.StatusIO, "GetTableSchema: %s", err)
 	}
@@ -363,17 +541,26 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 // --- Namespace: CurrentNamespacer ---
 
 func (c *connectionImpl) GetCurrentCatalog() (string, error) {
-	var name string
 	// CurrentNamespacer carries no context; the session is what matters here,
 	// so pass Background rather than reach for the pool's context-free API.
-	err := c.session().QueryRowContext(context.Background(),
-		"SELECT ORA_DATABASE_NAME FROM DUAL").Scan(&name)
+	ctx := context.Background()
+	sess, err := c.session(ctx)
+	if err != nil {
+		return "", err
+	}
+	var name string
+	err = sess.QueryRowContext(ctx, "SELECT ORA_DATABASE_NAME FROM DUAL").Scan(&name)
 	return name, err
 }
 
 func (c *connectionImpl) GetCurrentDbSchema() (string, error) {
+	ctx := context.Background()
+	sess, err := c.session(ctx)
+	if err != nil {
+		return "", err
+	}
 	var name string
-	err := c.session().QueryRowContext(context.Background(),
+	err = sess.QueryRowContext(ctx,
 		"SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL").Scan(&name)
 	return name, err
 }
@@ -384,9 +571,13 @@ func (c *connectionImpl) SetCurrentCatalog(catalog string) error {
 }
 
 func (c *connectionImpl) SetCurrentDbSchema(schema string) error {
-	_, err := c.session().ExecContext(context.Background(),
-		"ALTER SESSION SET CURRENT_SCHEMA = "+strings.ToUpper(schema))
+	ctx := context.Background()
+	sess, err := c.session(ctx)
 	if err != nil {
+		return err
+	}
+	if _, err := sess.ExecContext(ctx,
+		"ALTER SESSION SET CURRENT_SCHEMA = "+strings.ToUpper(schema)); err != nil {
 		return c.ErrorHelper.Errorf(adbc.StatusIO, "failed to set schema: %s", err)
 	}
 	return nil
@@ -394,17 +585,27 @@ func (c *connectionImpl) SetCurrentDbSchema(schema string) error {
 
 // --- Transactions ---
 
+// Commit ends the open transaction. driverbase rejects this with
+// StatusInvalidState while autocommit is on, so by here autocommit is off.
 func (c *connectionImpl) Commit(ctx context.Context) error {
-	_, err := c.session().ExecContext(ctx, "COMMIT")
-	if err != nil {
+	tx := c.takeTx()
+	if tx == nil {
+		// Autocommit is off but no statement has run, so there is nothing to
+		// end. Committing an empty transaction is not an error.
+		return nil
+	}
+	if err := tx.Commit(); err != nil {
 		return c.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
 	}
 	return nil
 }
 
 func (c *connectionImpl) Rollback(ctx context.Context) error {
-	_, err := c.session().ExecContext(ctx, "ROLLBACK")
-	if err != nil {
+	tx := c.takeTx()
+	if tx == nil {
+		return nil
+	}
+	if err := tx.Rollback(); err != nil {
 		return c.ErrorHelper.Errorf(adbc.StatusIO, "rollback failed: %s", err)
 	}
 	return nil
@@ -414,11 +615,29 @@ func (c *connectionImpl) Close() error {
 	if c.conn == nil {
 		return nil
 	}
+
+	// An open transaction has to end before the session goes back to the pool.
+	// database/sql's Conn.Close blocks until the transaction resolves rather
+	// than rolling it back, so skipping this hangs the caller outright. ADBC
+	// discards uncommitted work on close, so roll back.
+	var firstErr error
+	if tx := c.takeTx(); tx != nil {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			firstErr = c.ErrorHelper.Errorf(adbc.StatusIO, "rollback on close failed: %s", err)
+		}
+	}
+	if c.txCancel != nil {
+		c.txCancel()
+	}
+
 	// The pool belongs to the database, so this returns only the session this
 	// connection owned. The *sql.Conn stays referenced on purpose: database/sql
 	// then reports sql.ErrConnDone for any later use instead of dereferencing
 	// a nil pointer.
-	return c.conn.Close()
+	if err := c.conn.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }
 
 // --- Helpers ---
