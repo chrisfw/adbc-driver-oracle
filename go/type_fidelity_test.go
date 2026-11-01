@@ -18,10 +18,12 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -713,7 +715,7 @@ func TestAssembledDSNCarriesLobFetch(t *testing.T) {
 		LobFetchStream: "STREAM",
 	}
 	for opt, want := range cases {
-		dsn := assembleOracleURL("u", "p", "h", "1521", "s", "", "", opt)
+		dsn := assembleOracleURL("u", "p", "h", "1521", "s", "", "", opt, defaultPrefetchRows)
 		parsed, err := url.Parse(dsn)
 		if err != nil {
 			t.Fatalf("assembled DSN does not parse: %v", err)
@@ -1051,4 +1053,90 @@ func TestIntegration_StringWidthBoundaries(t *testing.T) {
 			t.Errorf("%s: content differs", c.name)
 		}
 	}
+}
+
+// --- oracle.prefetch_rows ---
+
+// The option has to reach go-ora through the DSN, since it is a connection
+// parameter. The default is unchanged from the value that was hard-coded
+// before the option existed, because measurement put it at the knee of the
+// curve: on a loopback five-column read, 25 rows per fetch gives 377k rows/s,
+// 1000 gives 417k, 10000 gives 635k, 50000 gives 646k, and 200000 falls back
+// to 442k. The knob exists because that knee moves with latency and row width,
+// not because 10000 was wrong.
+func TestAssembledDSNCarriesPrefetchRows(t *testing.T) {
+	cases := map[int]string{
+		0:                   strconv.Itoa(defaultPrefetchRows), // unset
+		-5:                  strconv.Itoa(defaultPrefetchRows), // nonsense floors to the default
+		1:                   "1",
+		defaultPrefetchRows: strconv.Itoa(defaultPrefetchRows),
+		50000:               "50000",
+	}
+	for in, want := range cases {
+		dsn := assembleOracleURL("u", "p", "h", "1521", "s", "", "", "", in)
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatalf("assembled DSN does not parse: %v", err)
+		}
+		if got := parsed.Query().Get("PREFETCH_ROWS"); got != want {
+			t.Errorf("prefetchRows %d produced PREFETCH_ROWS=%q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestPrefetchRowsOptionValidation(t *testing.T) {
+	drv := NewDriver(memory.DefaultAllocator)
+
+	// Accepted values round-trip through GetOption.
+	db, err := drv.NewDatabase(map[string]string{
+		OptionDSN:          "oracle://u:p@h:1521/s",
+		OptionPrefetchRows: "25000",
+	})
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+	if got := mustGetDBOption(t, db, OptionPrefetchRows); got != "25000" {
+		t.Errorf("GetOption = %q, want 25000", got)
+	}
+
+	// An unset option reports the default rather than an empty string.
+	plain, err := drv.NewDatabase(map[string]string{OptionDSN: "oracle://u:p@h:1521/s"})
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer plain.Close()
+	if got := mustGetDBOption(t, plain, OptionPrefetchRows); got != strconv.Itoa(defaultPrefetchRows) {
+		t.Errorf("unset GetOption = %q, want %d", got, defaultPrefetchRows)
+	}
+
+	// Values that cannot be a row count are refused rather than silently
+	// falling back, since a typo would otherwise cost throughput invisibly.
+	for _, bad := range []string{"0", "-1", "lots", "", "1.5", "10_000"} {
+		_, err := drv.NewDatabase(map[string]string{
+			OptionDSN:          "oracle://u:p@h:1521/s",
+			OptionPrefetchRows: bad,
+		})
+		if err == nil {
+			t.Errorf("prefetch_rows=%q was accepted, want an error", bad)
+			continue
+		}
+		var adbcErr adbc.Error
+		if errors.As(err, &adbcErr) && adbcErr.Code != adbc.StatusInvalidArgument {
+			t.Errorf("prefetch_rows=%q: status %v, want InvalidArgument", bad, adbcErr.Code)
+		}
+	}
+}
+
+func mustGetDBOption(t *testing.T, db adbc.Database, key string) string {
+	t.Helper()
+	getter, ok := db.(adbc.GetSetOptions)
+	if !ok {
+		t.Fatal("database does not implement adbc.GetSetOptions")
+	}
+	v, err := getter.GetOption(key)
+	if err != nil {
+		t.Fatalf("GetOption(%s): %v", key, err)
+	}
+	return v
 }

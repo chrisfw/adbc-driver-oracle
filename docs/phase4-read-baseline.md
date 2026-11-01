@@ -55,3 +55,65 @@ is for; 4.1 cannot fix it.
 For reference, the cheapest column (Int64, 2.2M rows/s) and the full five-column
 read (385k rows/s) differ by 5.7x, so per-column cost dominates and the
 mixed-type figure is the one to watch.
+
+## 4.1 result: the cheap wins are not where the cost is
+
+Measured after the 4.1 changes, same fixture and host. The figures are
+unchanged from the baseline above, within run-to-run noise:
+
+| Query | baseline rows/s | after 4.1 | allocs/row before | after |
+|-------|---------------:|----------:|------------------:|------:|
+| all five columns | 384,677 | 362,085 | 37.0 | 37.0 |
+| `NUMBER` x2 | 842,383 | 829,361 | 25.0 | 25.0 |
+| `VARCHAR2` x1 | 1,905,290 | 1,620,168 | 7.0 | 7.0 |
+| temporal x2 | 1,380,656 | 1,364,431 | 11.0 | 11.0 |
+| Int64 x1 | 2,209,621 | 2,134,316 | 8.0 | 8.0 |
+
+`AppendRows` now fills a whole batch per call, confirmed by counting: 5 calls
+for 200,000 rows where there used to be 200,000. It bought nothing measurable,
+because driverbase's per-call overhead was never the cost.
+
+A profile of the single-column Int64 read says where the cost actually is.
+Allocations, by object count:
+
+```
+39.92%  go-ora (*defaultStmt).read
+21.29%  go-ora (*ParameterInfo).decodePrimValue
+19.44%  go-ora (*Number).decode
+18.67%  bytes.(*Buffer).grow          <- from go-ora (*Number).String
+```
+
+That is 99.62% of allocations inside go-ora and none in this driver's reader.
+Note the last two lines: even an integral `NUMBER(10)` that maps to Int64 is
+rendered to a decimal string by go-ora and parsed back, allocating a
+`bytes.Buffer` per value.
+
+CPU tells the same story from the other side. Of 3.55s wall time, only 1.00s
+was on-CPU at all, so the read is about 72% waiting on fetch round trips.
+Within that CPU, `appendValue` and `appendInt64` together are 2%.
+
+### What this means for the remaining 4.1 bullets
+
+- **Per-column appender closures, replacing the per-cell type switch:** not
+  done, deliberately. The type switch it would remove is inside the 2% of CPU
+  that is 28% of wall time, so the ceiling on this change is roughly half a
+  percent, and replacing a type switch with an indirect closure call is not
+  obviously faster. Adding the indirection for an unmeasurable gain would be
+  the wrong trade. Worth revisiting only if 4.2 removes enough of the go-ora
+  cost to make per-cell dispatch visible.
+- **`oracle.prefetch_rows`:** done, with the default unchanged at 10000.
+  Measurement put the old hard-coded value at the knee of the curve, so the
+  option is for moving the knee, not for fixing a bad default.
+
+### Where this leaves Phase 4
+
+The 3x target in 4.2's exit criterion has to come from 4.2, because 4.1 had
+nothing to give: the driver's own read path contributes ~0.4% of allocations
+and 2% of CPU. 4.2 now has a precise target rather than a general one, namely
+`Number.decode`, `Number.String` and `decodePrimValue`, and the string round
+trip for integral NUMBER is the single clearest waste.
+
+The 72% round-trip wait also means throughput on this fixture is bounded by
+fetch latency, not decode. A columnar decode will show its full value on wider
+rows and on links where a fetch costs more, and the benchmark should grow a
+wide-row variant before 4.2 is measured, or it will understate the result.

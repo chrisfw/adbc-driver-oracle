@@ -64,6 +64,10 @@ type databaseImpl struct {
 	// defaultLobFetch. See OptionLobFetch.
 	lobFetch string
 
+	// prefetchRows is the rows per fetch round trip. Zero means
+	// defaultPrefetchRows. See OptionPrefetchRows.
+	prefetchRows int
+
 	// Connection pool — shared across all Open() calls.
 	// sql.DB is already a pool internally; we create it once and reuse.
 	pool     *sql.DB
@@ -109,6 +113,13 @@ func (db *databaseImpl) SetOption(key string, val string) error {
 				OptionNumberMapping, val,
 				NumberMappingFloat, NumberMappingDecimal, NumberMappingString)
 		}
+	case OptionPrefetchRows:
+		n, err := strconv.Atoi(val)
+		if err != nil || n < 1 {
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected a positive integer", OptionPrefetchRows, val)
+		}
+		db.prefetchRows = n
 	case OptionLobFetch:
 		if _, ok := oracleLobFetchParam(val); !ok {
 			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
@@ -170,6 +181,8 @@ func (db *databaseImpl) GetOption(key string) (string, error) {
 			return defaultLobFetch, nil
 		}
 		return db.lobFetch, nil
+	case OptionPrefetchRows:
+		return strconv.Itoa(db.effectivePrefetchRows()), nil
 	case OptionTzOffsetColumn:
 		if db.tzOffsetColumn {
 			return adbc.OptionValueEnabled, nil
@@ -196,6 +209,14 @@ func (db *databaseImpl) effectiveArrowTimeUnit() arrow.TimeUnit {
 	return unit
 }
 
+// effectivePrefetchRows resolves the unset value to the default.
+func (db *databaseImpl) effectivePrefetchRows() int {
+	if db.prefetchRows < 1 {
+		return defaultPrefetchRows
+	}
+	return db.prefetchRows
+}
+
 // effectiveTimestampUnit resolves the unset value to the default.
 func (db *databaseImpl) effectiveTimestampUnit() string {
 	if db.timestampUnit == "" {
@@ -214,7 +235,8 @@ func (db *databaseImpl) buildDSN() string {
 			if aliases, err := loadTNSAliases(db.walletLocation); err == nil {
 				if entry, ok := aliases[strings.ToLower(db.dsn)]; ok {
 					return assembleOracleURL(db.user, db.password, entry.Host, entry.Port,
-						entry.Service, db.walletLocation, db.walletPassword, db.lobFetch)
+						entry.Service, db.walletLocation, db.walletPassword, db.lobFetch,
+						db.effectivePrefetchRows())
 				}
 			}
 		}
@@ -222,12 +244,12 @@ func (db *databaseImpl) buildDSN() string {
 	}
 
 	return assembleOracleURL(db.user, db.password, db.hostname, db.port, db.serviceName,
-		db.walletLocation, db.walletPassword, db.lobFetch)
+		db.walletLocation, db.walletPassword, db.lobFetch, db.effectivePrefetchRows())
 }
 
 // assembleOracleURL builds the oracle://user:pass@host:port/service URL with
 // the same query-parameter conventions used historically by buildDSN.
-func assembleOracleURL(user, password, host, port, service, walletLocation, walletPassword, lobFetch string) string {
+func assembleOracleURL(user, password, host, port, service, walletLocation, walletPassword, lobFetch string, prefetchRows int) string {
 	dsn := fmt.Sprintf("oracle://%s:%s@%s:%s/%s",
 		url.PathEscape(user),
 		url.PathEscape(password),
@@ -236,7 +258,10 @@ func assembleOracleURL(user, password, host, port, service, walletLocation, wall
 		service,
 	)
 	params := url.Values{}
-	params.Set("PREFETCH_ROWS", "10000")
+	if prefetchRows < 1 {
+		prefetchRows = defaultPrefetchRows
+	}
+	params.Set("PREFETCH_ROWS", strconv.Itoa(prefetchRows))
 	// go-ora's own default is INLINE, but setting it explicitly keeps the
 	// behaviour pinned to this driver's documented default rather than to
 	// whatever go-ora changes its mind about.

@@ -69,6 +69,18 @@ const (
 	// while sizing string columns (default 64 MiB).
 	OptionIngestTypeScanLimit = "oracle.ingest.type_scan_limit_bytes"
 
+	// prefetch_rows is how many rows Oracle returns per fetch round trip
+	// (default 10000).
+	//
+	// Measured on a loopback connection over a five-column table, the default
+	// is already near the knee: 25 rows gives 377k rows/s, 1000 gives 417k,
+	// 10000 gives 635k, 50000 gives 646k, and 200000 drops back to 442k as
+	// the per-fetch buffers stop paying for themselves. The option exists
+	// because the knee moves: a high-latency link wants more rows per trip,
+	// and very wide rows may need fewer to bound memory, since go-ora sizes
+	// its row buffer from the declared column widths.
+	OptionPrefetchRows = "oracle.prefetch_rows"
+
 	// lob_fetch chooses how go-ora retrieves CLOB and BLOB values. See the
 	// LobFetch* constants. Defaults to inline.
 	//
@@ -100,6 +112,11 @@ const (
 	OptionNumberMapping = "oracle.number_mapping"
 
 	DefaultPort = "1521"
+
+	// defaultPrefetchRows is what an unset oracle.prefetch_rows means. It was
+	// the hard-coded value before the option existed, and measurement put it
+	// at the knee of the curve, so exposing the knob did not change it.
+	defaultPrefetchRows = 10000
 )
 
 // Accepted values for OptionNumberMapping.

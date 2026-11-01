@@ -286,8 +286,9 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 	}
 
 	impl := &oracleRecordReader{
-		rows:   rows,
-		policy: s.cnxn.typePolicy(),
+		rows:      rows,
+		policy:    s.cnxn.typePolicy(),
+		batchRows: readerBatchRows,
 	}
 
 	var rr driverbase.BaseRecordReader
@@ -295,7 +296,8 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 	// argument to BaseRecordReader.Init (previously just (ctx, alloc,
 	// params, options, impl)). Pass slog.Default() — driverbase rejects
 	// a nil logger.
-	if err := rr.Init(ctx, s.alloc, slog.Default(), nil, driverbase.BaseRecordReaderOptions{}, impl); err != nil {
+	if err := rr.Init(ctx, s.alloc, slog.Default(), nil,
+		driverbase.BaseRecordReaderOptions{BatchRowLimit: readerBatchRows}, impl); err != nil {
 		rows.Close()
 		return nil, -1, err
 	}
@@ -1863,9 +1865,14 @@ type outputField struct {
 }
 
 type oracleRecordReader struct {
-	rows        *sql.Rows
-	colTypes    []*sql.ColumnType
-	outputs     []outputField
+	rows     *sql.Rows
+	colTypes []*sql.ColumnType
+	outputs  []outputField
+
+	// batchRows is how many rows one AppendRows call fills. It matches the
+	// batch row limit given to driverbase, so a full batch costs one call
+	// rather than one per row.
+	batchRows   int64
 	scanDest    []interface{}
 	scanVals    []interface{}
 	geomIndices []int
@@ -1968,42 +1975,64 @@ func (r *oracleRecordReader) BeginAppending(builder *array.RecordBuilder) error 
 	return nil
 }
 
-// AppendRows appends one row per call. The new driverbase API (since
-// 20260409) batches multiple rows per call to amortize builder overhead;
-// we keep the per-row semantics by returning rowCount=1 each call.
+// AppendRows fills up to batchRows rows per call.
+//
+// It used to append exactly one. driverbase calls this until the batch row
+// limit is reached, so one row per call meant its loop, and everything it does
+// per call, ran once per row: five million times for a five million row read.
+// That was most of the fixed per-row cost, which showed up as eight
+// allocations to read a single int64 column.
+//
+// Returning early with rows already appended is fine and is how end of data is
+// reported: driverbase keeps the rows and calls again, and the next call
+// returns io.EOF with nothing appended.
 func (r *oracleRecordReader) AppendRows(builder *array.RecordBuilder) (int64, int64, error) {
-	// Replay peeked first row if available
-	if r.hasFirstRow {
-		r.hasFirstRow = false
-		copy(r.scanVals, r.firstRow)
-		r.firstRow = nil
-	} else {
-		if !r.rows.Next() {
-			if err := r.rows.Err(); err != nil {
-				return 0, 0, err
+	var (
+		rows    int64
+		rowSize int64
+		target  = r.batchRows
+	)
+	if target < 1 {
+		target = 1
+	}
+
+	for rows < target {
+		if r.hasFirstRow {
+			// The SRID peek in NextResultSet consumed a row; replay it.
+			r.hasFirstRow = false
+			copy(r.scanVals, r.firstRow)
+			r.firstRow = nil
+		} else {
+			if !r.rows.Next() {
+				if err := r.rows.Err(); err != nil {
+					return rows, rowSize, err
+				}
+				if rows == 0 {
+					return 0, 0, io.EOF
+				}
+				// Hand back what was appended; the next call reports EOF.
+				return rows, rowSize, nil
 			}
-			return 0, 0, io.EOF
+			if err := r.rows.Scan(r.scanDest...); err != nil {
+				return rows, rowSize, fmt.Errorf("scan error: %w", err)
+			}
 		}
 
-		if err := r.rows.Scan(r.scanDest...); err != nil {
-			return 0, 0, fmt.Errorf("scan error: %w", err)
+		for field, o := range r.outputs {
+			val := r.scanVals[o.col]
+			switch o.kind {
+			case outputGeometry:
+				rowSize += r.appendGeometry(builder.Field(field), val)
+			case outputZone:
+				rowSize += appendZone(builder.Field(field), val)
+			default:
+				rowSize += appendValue(builder.Field(field), val, r.colTypes[o.col])
+			}
 		}
+		rows++
 	}
 
-	var rowSize int64
-	for field, o := range r.outputs {
-		val := r.scanVals[o.col]
-		switch o.kind {
-		case outputGeometry:
-			rowSize += r.appendGeometry(builder.Field(field), val)
-		case outputZone:
-			rowSize += appendZone(builder.Field(field), val)
-		default:
-			rowSize += appendValue(builder.Field(field), val, r.colTypes[o.col])
-		}
-	}
-
-	return 1, rowSize, nil
+	return rows, rowSize, nil
 }
 
 // appendZone writes the zone a timestamp arrived in: the IANA region name when
@@ -2084,6 +2113,14 @@ func (r *oracleRecordReader) Close() error {
 // =============================================================================
 // Type mapping
 // =============================================================================
+
+// readerBatchRows is the rows per Arrow batch, and so also the rows one
+// AppendRows call fills. Set on both sides so they cannot drift: driverbase
+// ends a batch once this many rows are in, and the reader fills exactly that
+// many per call, which makes a batch cost one call instead of one per row.
+//
+// 65536 is driverbase's own default, kept so batch sizes do not change.
+const readerBatchRows = 65536
 
 var timestampNoTZ = &arrow.TimestampType{Unit: arrow.Microsecond}
 
