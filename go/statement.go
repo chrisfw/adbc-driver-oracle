@@ -47,6 +47,12 @@ type statementImpl struct {
 
 	// Prepared statement support
 	prepared *sql.Stmt
+	// preparedTx is the transaction `prepared` was created on, or nil when it
+	// was prepared on the bare session. database/sql closes a transaction's
+	// prepared statements when that transaction ends, so once the connection
+	// moves to a different transaction the statement has to be prepared
+	// again. Always nil under autocommit, where there is no transaction.
+	preparedTx *sql.Tx
 
 	// Bind parameters (single batch)
 	bindParams arrow.RecordBatch
@@ -64,6 +70,11 @@ type statementImpl struct {
 	ingestScanLimitByte int64           // max bytes buffered for the auto type scan (0 = scan disabled)
 	ingestScanLimitSet  bool            // distinguishes "unset, use default" from an explicit 0
 
+	// explicitlyPrepared records that the caller called Prepare, so the
+	// statement is re-prepared after a transaction ends rather than quietly
+	// falling back to an ad-hoc execute.
+	explicitlyPrepared bool
+
 	// inlineLimit is the VARCHAR2/CLOB byte boundary for this ingest, resolved
 	// from the server's MAX_STRING_SIZE (4000 STANDARD / 32767 EXTENDED) once
 	// executeBulkIngest starts. Threaded into resolveColumnTypes (DDL) and
@@ -78,6 +89,9 @@ func (s *statementImpl) Base() *driverbase.StatementImplBase {
 func (s *statementImpl) SetSqlQuery(query string) error {
 	s.query = query
 	s.closePrepared()
+	// A new query discards the caller's Prepare along with the statement it
+	// produced; executing it again should not silently re-prepare.
+	s.explicitlyPrepared = false
 	return nil
 }
 
@@ -156,16 +170,44 @@ func (s *statementImpl) Prepare(ctx context.Context) error {
 	// Preparing on the open transaction when there is one: a *sql.Stmt is
 	// bound to whatever began it, and one prepared on the bare session would
 	// execute outside the caller's transaction.
+	_, err := s.preparedStmt(ctx)
+	return err
+}
+
+// preparedStmt returns the statement to execute, preparing it if needed and
+// re-preparing it when the transaction it belonged to has ended.
+//
+// ADBC lets a caller prepare once and execute many times, including either
+// side of a Commit, but database/sql closes a transaction's prepared
+// statements along with the transaction. Tracking which transaction the
+// statement belongs to catches that: same transaction (or none, under
+// autocommit) reuses it, a different one prepares again. Returns nil when
+// nothing has been prepared, which is how the execute paths tell the
+// prepared and ad-hoc cases apart.
+func (s *statementImpl) preparedStmt(ctx context.Context) (*sql.Stmt, error) {
+	if s.prepared != nil && s.preparedTx == s.cnxn.tx {
+		return s.prepared, nil
+	}
+	if s.prepared == nil && !s.explicitlyPrepared {
+		return nil, nil
+	}
+	if s.query == "" {
+		return nil, s.ErrorHelper.Errorf(adbc.StatusInvalidState, "no query set")
+	}
+
 	sess, err := s.cnxn.session(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	s.closePrepared()
 	stmt, err := sess.PrepareContext(ctx, s.query)
 	if err != nil {
-		return s.ErrorHelper.Errorf(adbc.StatusIO, "prepare failed: %s", err)
+		return nil, s.ErrorHelper.Errorf(adbc.StatusIO, "prepare failed: %s", err)
 	}
 	s.prepared = stmt
-	return nil
+	s.preparedTx = s.cnxn.tx
+	s.explicitlyPrepared = true
+	return s.prepared, nil
 }
 
 func (s *statementImpl) Bind(ctx context.Context, values arrow.RecordBatch) error {
@@ -198,10 +240,14 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 	// Build query args from bind parameters
 	args := s.extractBindArgs(0)
 
+	prepared, err := s.preparedStmt(ctx)
+	if err != nil {
+		return nil, -1, err
+	}
+
 	var rows *sql.Rows
-	var err error
-	if s.prepared != nil {
-		rows, err = s.prepared.QueryContext(ctx, args...)
+	if prepared != nil {
+		rows, err = prepared.QueryContext(ctx, args...)
 	} else {
 		sess, sessErr := s.cnxn.session(ctx)
 		if sessErr != nil {
@@ -241,10 +287,14 @@ func (s *statementImpl) ExecuteUpdate(ctx context.Context) (int64, error) {
 	}
 
 	exec := func(args []interface{}) (int64, error) {
+		prepared, err := s.preparedStmt(ctx)
+		if err != nil {
+			return -1, err
+		}
+
 		var result sql.Result
-		var err error
-		if s.prepared != nil {
-			result, err = s.prepared.ExecContext(ctx, args...)
+		if prepared != nil {
+			result, err = prepared.ExecContext(ctx, args...)
 		} else {
 			sess, sessErr := s.cnxn.session(ctx)
 			if sessErr != nil {
@@ -1569,6 +1619,7 @@ func (s *statementImpl) closePrepared() {
 		s.prepared.Close()
 		s.prepared = nil
 	}
+	s.preparedTx = nil
 }
 
 // =============================================================================

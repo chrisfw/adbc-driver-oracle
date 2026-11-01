@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -571,16 +572,77 @@ func (c *connectionImpl) SetCurrentCatalog(catalog string) error {
 }
 
 func (c *connectionImpl) SetCurrentDbSchema(schema string) error {
+	ident, err := normalizeSchemaIdentifier(schema)
+	if err != nil {
+		return c.ErrorHelper.Errorf(adbc.StatusInvalidArgument, "invalid schema name: %s", err)
+	}
+
 	ctx := context.Background()
 	sess, err := c.session(ctx)
 	if err != nil {
 		return err
 	}
+	// Quoted, so Oracle can only read the value as a single identifier.
+	// ALTER SESSION takes a list of parameters, so concatenating the name raw
+	// let a caller set any other session parameter: a schema of
+	// `ADBC NLS_DATE_FORMAT = 'YYYY'` changed the date format too. Quoted, the
+	// same string is one (nonexistent) identifier and fails with ORA-01435.
 	if _, err := sess.ExecContext(ctx,
-		"ALTER SESSION SET CURRENT_SCHEMA = "+strings.ToUpper(schema)); err != nil {
-		return c.ErrorHelper.Errorf(adbc.StatusIO, "failed to set schema: %s", err)
+		"ALTER SESSION SET CURRENT_SCHEMA = "+quoteOracleIdentifier(ident)); err != nil {
+		return c.ErrorHelper.Errorf(adbc.StatusIO, "failed to set schema to %q: %s", ident, err)
 	}
 	return nil
+}
+
+// maxOracleIdentifierBytes is the identifier length Oracle allows from 12.2
+// onward. Older servers cap at 30 and reject a longer name themselves, so this
+// bound only exists to fail obvious junk early with a clear message.
+const maxOracleIdentifierBytes = 128
+
+// quoteOracleIdentifier renders name as an Oracle delimited identifier:
+// wrapped in double quotes with any embedded quote doubled. Quoting
+// unconditionally is what makes the value inert: Oracle can only read it as
+// one identifier, never as additional statement syntax.
+func quoteOracleIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// normalizeSchemaIdentifier resolves a caller-supplied schema name to the
+// identifier Oracle should see.
+//
+// Oracle folds an unquoted identifier to upper case and takes a quoted one
+// literally, so `hr`, `HR` and `Hr` all mean the schema HR while `"hr"` means
+// a genuinely lower-case one. Bare names are what callers pass almost always,
+// so those are upper-cased, which is what this driver has always done; a name
+// the caller already wrapped in quotes is honoured exactly.
+//
+// Rejecting a quote here is defence in depth rather than the actual defence:
+// quoteOracleIdentifier escapes whatever gets through, so the error exists to
+// say what is wrong instead of letting Oracle answer with a puzzling
+// ORA-01435.
+func normalizeSchemaIdentifier(name string) (string, error) {
+	s := strings.TrimSpace(name)
+	if s == "" {
+		return "", errors.New("name is empty")
+	}
+	if len(s) >= 2 && strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`) {
+		s = s[1 : len(s)-1] // caller asked for an exact-case identifier
+	} else {
+		s = strings.ToUpper(s)
+	}
+
+	switch {
+	case s == "":
+		return "", errors.New("name is empty")
+	case strings.ContainsRune(s, 0):
+		return "", errors.New("name contains a NUL byte")
+	case strings.Contains(s, `"`):
+		return "", fmt.Errorf("name contains a double quote: %q", name)
+	case len(s) > maxOracleIdentifierBytes:
+		return "", fmt.Errorf("name is %d bytes, over Oracle's %d-byte identifier limit",
+			len(s), maxOracleIdentifierBytes)
+	}
+	return s, nil
 }
 
 // --- Transactions ---

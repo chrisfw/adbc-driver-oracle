@@ -101,6 +101,12 @@ it; the statement after that begins a fresh one. Switching autocommit back on
 commits whatever is pending. Closing a connection with an open transaction
 discards the uncommitted work.
 
+`adbc.connection.current_db_schema` issues `ALTER SESSION SET CURRENT_SCHEMA`
+on the connection's own session, so it affects only that connection. The name
+is sent as a quoted identifier: a bare name is upper-cased the way Oracle folds
+an unquoted identifier (`hr` and `HR` both mean `HR`), and a name you wrap in
+double quotes yourself is used verbatim for a genuinely mixed-case schema.
+
 `adbc.connection.transaction.isolation_level` accepts `read_committed` (the
 Oracle default) and `serializable`. The other ADBC levels have no Oracle
 equivalent and are refused with `StatusNotImplemented` rather than silently
