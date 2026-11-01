@@ -17,6 +17,7 @@ package oracle
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -190,9 +191,9 @@ func TestArrowColumnToSliceRangeTemporal(t *testing.T) {
 		arr := b.NewArray()
 		defer arr.Release()
 
-		got, ok := arrowColumnToSliceRange(arr, 0, 2, maxInlineStringBytes).([]go_ora.NullTimeStamp)
+		got, ok := arrowColumnToSliceRange(arr, 0, 2, false).([]go_ora.NullTimeStamp)
 		if !ok {
-			t.Fatalf("expected []go_ora.NullTimeStamp, got %T", arrowColumnToSliceRange(arr, 0, 2, maxInlineStringBytes))
+			t.Fatalf("expected []go_ora.NullTimeStamp, got %T", arrowColumnToSliceRange(arr, 0, 2, false))
 		}
 		if !got[0].Valid || !time.Time(got[0].TimeStamp).Equal(want) {
 			t.Errorf("got %v, want %v", time.Time(got[0].TimeStamp), want)
@@ -212,9 +213,9 @@ func TestArrowColumnToSliceRangeTemporal(t *testing.T) {
 		arr := b.NewArray()
 		defer arr.Release()
 
-		got, ok := arrowColumnToSliceRange(arr, 0, 1, maxInlineStringBytes).([]sql.NullTime)
+		got, ok := arrowColumnToSliceRange(arr, 0, 1, false).([]sql.NullTime)
 		if !ok {
-			t.Fatalf("expected []sql.NullTime, got %T", arrowColumnToSliceRange(arr, 0, 1, maxInlineStringBytes))
+			t.Fatalf("expected []sql.NullTime, got %T", arrowColumnToSliceRange(arr, 0, 1, false))
 		}
 		if !got[0].Valid || !got[0].Time.Equal(instant) {
 			t.Errorf("got %v, want instant %v", got[0].Time, instant)
@@ -231,7 +232,7 @@ func TestArrowColumnToSliceRangeTemporal(t *testing.T) {
 		arr := b.NewArray()
 		defer arr.Release()
 
-		got := arrowColumnToSliceRange(arr, 0, 1, maxInlineStringBytes).([]go_ora.NullTimeStamp)
+		got := arrowColumnToSliceRange(arr, 0, 1, false).([]go_ora.NullTimeStamp)
 		if !time.Time(got[0].TimeStamp).Equal(want) {
 			t.Errorf("got %v, want %v (unit must not be assumed µs)", time.Time(got[0].TimeStamp), want)
 		}
@@ -245,7 +246,7 @@ func TestArrowColumnToSliceRangeTemporal(t *testing.T) {
 		arr := b.NewArray()
 		defer arr.Release()
 
-		got := arrowColumnToSliceRange(arr, 0, 1, maxInlineStringBytes).([]go_ora.NullTimeStamp)
+		got := arrowColumnToSliceRange(arr, 0, 1, false).([]go_ora.NullTimeStamp)
 		if !time.Time(got[0].TimeStamp).Equal(d) {
 			t.Errorf("got %v, want %v", time.Time(got[0].TimeStamp), d)
 		}
@@ -261,9 +262,9 @@ func TestArrowColumnToSliceRangeScalars(t *testing.T) {
 		arr := b.NewArray()
 		defer arr.Release()
 
-		got, ok := arrowColumnToSliceRange(arr, 0, 3, maxInlineStringBytes).([]sql.NullInt64)
+		got, ok := arrowColumnToSliceRange(arr, 0, 3, false).([]sql.NullInt64)
 		if !ok {
-			t.Fatalf("expected []sql.NullInt64, got %T", arrowColumnToSliceRange(arr, 0, 3, maxInlineStringBytes))
+			t.Fatalf("expected []sql.NullInt64, got %T", arrowColumnToSliceRange(arr, 0, 3, false))
 		}
 		if got[0].Int64 != 1 || got[1].Int64 != 0 || got[2].Valid {
 			t.Errorf("got %v, want [1 0 null]", got)
@@ -277,7 +278,7 @@ func TestArrowColumnToSliceRangeScalars(t *testing.T) {
 		arr := b.NewArray()
 		defer arr.Release()
 
-		got := arrowColumnToSliceRange(arr, 0, 2, maxInlineStringBytes).([]sql.NullString)
+		got := arrowColumnToSliceRange(arr, 0, 2, false).([]sql.NullString)
 		if got[0].String != "18446744073709551615" || got[1].String != "42" {
 			t.Errorf("got %v", got)
 		}
@@ -290,7 +291,7 @@ func TestArrowColumnToSliceRangeScalars(t *testing.T) {
 		arr := b.NewArray()
 		defer arr.Release()
 
-		got := arrowColumnToSliceRange(arr, 0, 1, maxInlineStringBytes).([]sql.NullFloat64)
+		got := arrowColumnToSliceRange(arr, 0, 1, false).([]sql.NullFloat64)
 		if got[0].Float64 != 1.5 {
 			t.Errorf("got %v", got)
 		}
@@ -303,7 +304,7 @@ func TestArrowColumnToSliceRangeScalars(t *testing.T) {
 		arr := b.NewArray()
 		defer arr.Release()
 
-		got := arrowColumnToSliceRange(arr, 0, 1, maxInlineStringBytes).([]sql.NullInt64)
+		got := arrowColumnToSliceRange(arr, 0, 1, false).([]sql.NullInt64)
 		if got[0].Int64 != -7 {
 			t.Errorf("got %v", got)
 		}
@@ -319,17 +320,18 @@ func TestArrowColumnToSliceRangeScalars(t *testing.T) {
 		arr := b.NewArray()
 		defer arr.Release()
 
-		got := arrowColumnToSliceRange(arr, 0, 1, maxInlineStringBytes).([]sql.NullString)
+		got := arrowColumnToSliceRange(arr, 0, 1, false).([]sql.NullString)
 		if got[0].String != "12345.67" {
 			t.Errorf("got %q, want 12345.67", got[0].String)
 		}
 	})
 }
 
-// Batches with values beyond the VARCHAR2 cap must switch to the go_ora.Clob
-// bind: plain string binds ride go-ora's negotiated varchar limit and can fail
-// on MAX_STRING_SIZE=STANDARD servers even when the column is CLOB.
-func TestStringColumnToSliceWideBindsAsClob(t *testing.T) {
+// A CLOB destination column takes the go_ora.Clob bind at any value width:
+// plain string binds ride go-ora's negotiated varchar limit and fail on a
+// value past it, so a CLOB column cannot use them. Values and nulls have to
+// survive the conversion intact.
+func TestStringColumnToSliceClobBind(t *testing.T) {
 	b := array.NewStringBuilder(memory.DefaultAllocator)
 	defer b.Release()
 	wide := strings.Repeat("x", 4001)
@@ -338,9 +340,9 @@ func TestStringColumnToSliceWideBindsAsClob(t *testing.T) {
 	arr := b.NewArray()
 	defer arr.Release()
 
-	got, ok := arrowColumnToSliceRange(arr, 0, 3, maxInlineStringBytes).([]go_ora.Clob)
+	got, ok := arrowColumnToSliceRange(arr, 0, 3, true).([]go_ora.Clob)
 	if !ok {
-		t.Fatalf("expected []go_ora.Clob for wide batch, got %T", arrowColumnToSliceRange(arr, 0, 3, maxInlineStringBytes))
+		t.Fatalf("expected []go_ora.Clob, got %T", arrowColumnToSliceRange(arr, 0, 3, true))
 	}
 	if !got[0].Valid || got[0].String != wide {
 		t.Errorf("wide value mismatch: valid=%v len=%d", got[0].Valid, len(got[0].String))
@@ -351,30 +353,59 @@ func TestStringColumnToSliceWideBindsAsClob(t *testing.T) {
 	if got[2].Valid {
 		t.Error("expected null at index 2")
 	}
+
+	// The same column with a VARCHAR2 destination takes the cheap array bind,
+	// whatever the data looks like. The bind follows the column, not the batch.
+	strs, ok := arrowColumnToSliceRange(arr, 0, 3, false).([]sql.NullString)
+	if !ok {
+		t.Fatalf("expected []sql.NullString, got %T", arrowColumnToSliceRange(arr, 0, 3, false))
+	}
+	if !strs[0].Valid || strs[0].String != wide {
+		t.Errorf("wide value mismatch: valid=%v len=%d", strs[0].Valid, len(strs[0].String))
+	}
+	if strs[2].Valid {
+		t.Error("expected null at index 2")
+	}
+}
+
+// The bind type must be identical for every batch of an ingest, because the
+// INSERT is prepared once and reused. Switching a parameter from a string bind
+// to a Clob bind between two executes of one prepared statement desynchronizes
+// go-ora's TTC stream (ORA-03106 / ORA-03146), which is what the old
+// per-batch width heuristic did the first time a narrow batch was followed by
+// a wide one. Same decision in, same bind type out, regardless of widths.
+func TestStringBindIsStableAcrossBatchWidths(t *testing.T) {
+	mk := func(vals ...string) arrow.Array {
+		b := array.NewStringBuilder(memory.DefaultAllocator)
+		defer b.Release()
+		b.AppendValues(vals, nil)
+		return b.NewArray()
+	}
+	narrow := mk("tiny", "small")
+	defer narrow.Release()
+	wide := mk(strings.Repeat("z", 12000), "small")
+	defer wide.Release()
+
+	for _, asClob := range []bool{false, true} {
+		first := fmt.Sprintf("%T", arrowColumnToSliceRange(narrow, 0, 2, asClob))
+		second := fmt.Sprintf("%T", arrowColumnToSliceRange(wide, 0, 2, asClob))
+		if first != second {
+			t.Errorf("asClob=%v: narrow batch bound as %s but wide batch as %s; "+
+				"a reused prepared statement cannot survive that switch", asClob, first, second)
+		}
+	}
 }
 
 // On MAX_STRING_SIZE=EXTENDED servers a value between the STANDARD cap and
-// 32767 bytes stays a plain VARCHAR2 bind (fast batch array), not a per-row
-// go_ora.Clob — this is what keeps wide-text ingest (e.g. OSM other_tags) off
-// the slow temporary-LOB path. The same value on a STANDARD server must fall
-// back to CLOB. Both the bind type and the DDL type track inlineLimit together.
+// 32767 bytes must stay an inline VARCHAR2 column, so it keeps the fast array
+// bind instead of a temporary LOB per row. This is what keeps wide-text ingest
+// (e.g. OSM other_tags) off the slow path. The same value on a STANDARD server
+// has to fall back to CLOB.
+//
+// The width lives in the DDL decision alone now. The bind follows whatever
+// column type came out of it, which is what TestStringColumnToSliceClobBind
+// and TestStringBindIsStableAcrossBatchWidths cover.
 func TestStringColumnExtendedVarcharAvoidsClob(t *testing.T) {
-	b := array.NewStringBuilder(memory.DefaultAllocator)
-	defer b.Release()
-	mid := strings.Repeat("x", 5000) // > 4000, < 32767
-	b.AppendValues([]string{mid, "small"}, nil)
-	arr := b.NewArray()
-	defer arr.Release()
-
-	if _, ok := arrowColumnToSliceRange(arr, 0, 2, maxExtendedStringBytes).([]sql.NullString); !ok {
-		t.Fatalf("EXTENDED: expected []sql.NullString for 5000-byte value, got %T",
-			arrowColumnToSliceRange(arr, 0, 2, maxExtendedStringBytes))
-	}
-	if _, ok := arrowColumnToSliceRange(arr, 0, 2, maxInlineStringBytes).([]go_ora.Clob); !ok {
-		t.Fatalf("STANDARD: expected []go_ora.Clob for 5000-byte value, got %T",
-			arrowColumnToSliceRange(arr, 0, 2, maxInlineStringBytes))
-	}
-
 	schema := arrow.NewSchema([]arrow.Field{{Name: "tags", Type: arrow.BinaryTypes.String}}, nil)
 	widths := []int{5000}
 	// The declared width comes from varcharDeclWidth, so assert the property
@@ -425,7 +456,7 @@ func TestArrowColumnToSliceRangeDeepCopies(t *testing.T) {
 		arr := b.NewArray()
 		b.Release()
 
-		got := arrowColumnToSliceRange(arr, 0, 1, maxInlineStringBytes).([]sql.NullString)
+		got := arrowColumnToSliceRange(arr, 0, 1, false).([]sql.NullString)
 		arr.Release() // buffers returned to the allocator here
 		if got[0].String != "hello world" {
 			t.Errorf("got %q", got[0].String)
@@ -438,7 +469,7 @@ func TestArrowColumnToSliceRangeDeepCopies(t *testing.T) {
 		arr := b.NewArray()
 		b.Release()
 
-		got := arrowColumnToSliceRange(arr, 0, 1, maxInlineStringBytes).([][]byte)
+		got := arrowColumnToSliceRange(arr, 0, 1, false).([][]byte)
 		arr.Release()
 		if len(got[0]) != 3 || got[0][0] != 1 {
 			t.Errorf("got %v", got[0])

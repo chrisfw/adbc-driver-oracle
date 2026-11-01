@@ -75,10 +75,15 @@ type statementImpl struct {
 	// falling back to an ad-hoc execute.
 	explicitlyPrepared bool
 
+	// clobBinds[i] says whether column i binds as a CLOB for every batch of
+	// this ingest. Resolved once by resolveStringBinds; read via bindsAsClob.
+	clobBinds []bool
+
 	// inlineLimit is the VARCHAR2/CLOB byte boundary for this ingest, resolved
 	// from the server's MAX_STRING_SIZE (4000 STANDARD / 32767 EXTENDED) once
-	// executeBulkIngest starts. Threaded into resolveColumnTypes (DDL) and
-	// stringColumnToSlice (bind type) so both agree per column.
+	// executeBulkIngest starts. It decides the DDL type in resolveColumnTypes;
+	// the bind type then follows that column type rather than this limit, via
+	// resolveStringBinds.
 	inlineLimit int
 }
 
@@ -414,10 +419,10 @@ func extractArrowValue(arr arrow.Array, idx int) interface{} {
 func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	tableName := strings.ToUpper(s.ingestTargetTable)
 
-	// Resolve the VARCHAR2/CLOB boundary from the server's MAX_STRING_SIZE once,
-	// up front: both the DDL (resolveColumnTypes) and the per-batch bind type
-	// (stringColumnToSlice) must use the same limit or a VARCHAR2 column could
-	// receive a CLOB bind (or vice versa).
+	// Resolve the VARCHAR2/CLOB boundary from the server's MAX_STRING_SIZE
+	// once, up front: it is what decides whether a string column is declared
+	// VARCHAR2 or CLOB, and a column declared wider than the server allows
+	// would fail at insert time.
 	s.inlineLimit = s.cnxn.inlineStringLimit(ctx)
 
 	// Determine the schema from bindStream or bindParams
@@ -498,6 +503,10 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 		return -1, err
 	}
 
+	// Fix the string bind per column now that the table has its final shape,
+	// and before anything is bound. This must not be decided per batch.
+	s.clobBinds = s.resolveStringBinds(ctx, tableName, schema, mode, colTypes)
+
 	// Build INSERT statement.
 	// Geometry columns are converted client-side from WKB to SdoGeometry UDT
 	// structs and sent via go-ora's Object encoding (see wkbColumnToSdoSliceRange).
@@ -553,7 +562,7 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 					// This also copies the data, so Arrow buffer reuse is safe.
 					args[col] = wkbColumnToSdoSliceRange(arr, 0, nrow, srid)
 				} else {
-					args[col] = arrowColumnToSliceRange(arr, 0, nrow, s.inlineLimit)
+					args[col] = arrowColumnToSliceRange(arr, 0, nrow, s.bindsAsClob(col))
 				}
 			}
 			return preparedBatchT{args: args, nrow: nrow}
@@ -752,7 +761,7 @@ func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec a
 		if srid, ok := s.ingestGeomCols[col]; ok {
 			args[col] = wkbColumnToSdoSliceRange(arr, startRow, endRow, srid)
 		} else {
-			args[col] = arrowColumnToSliceRange(arr, startRow, endRow, s.inlineLimit)
+			args[col] = arrowColumnToSliceRange(arr, startRow, endRow, s.bindsAsClob(col))
 		}
 	}
 
@@ -955,11 +964,14 @@ func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL strin
 // and fail on the ISO-8601 'T' separator (ORA-01858); stringified booleans
 // ("true") fail NUMBER(1) conversion (ORA-01722).
 //
+// asClob says whether string columns take the CLOB bind; it is fixed per
+// column for the whole ingest by resolveStringBinds.
+//
 // Everything variable-length is deep-copied: Arrow Value() calls alias the
 // underlying buffer, which is released when the next stream record arrives.
 // Holding the alias past that point produces use-after-free corruption
 // (manifests as garbled VARCHAR2 columns through Oracle's bulk array bind).
-func arrowColumnToSliceRange(arr arrow.Array, start, end, inlineLimit int) interface{} {
+func arrowColumnToSliceRange(arr arrow.Array, start, end int, asClob bool) interface{} {
 	numRows := end - start
 	switch a := arr.(type) {
 	case *array.Int64:
@@ -1017,9 +1029,9 @@ func arrowColumnToSliceRange(arr arrow.Array, start, end, inlineLimit int) inter
 		}
 		return vals
 	case *array.String:
-		return stringColumnToSlice(a, start, end, inlineLimit)
+		return stringColumnToSlice(a, start, end, asClob)
 	case *array.LargeString:
-		return stringColumnToSlice(a, start, end, inlineLimit)
+		return stringColumnToSlice(a, start, end, asClob)
 	case *array.Binary:
 		return binaryColumnToSlice(a, start, end)
 	case *array.LargeBinary:
@@ -1065,7 +1077,7 @@ func arrowColumnToSliceRange(arr arrow.Array, start, end, inlineLimit int) inter
 		}
 		return vals
 	case *array.StringView:
-		return stringColumnToSlice(a, start, end, inlineLimit)
+		return stringColumnToSlice(a, start, end, asClob)
 	default:
 		// Remaining types (Time32/64, Duration, Interval, Dictionary, nested…)
 		// have no natural Oracle mapping; bind their textual form into the
@@ -1079,6 +1091,146 @@ func arrowColumnToSliceRange(arr arrow.Array, start, end, inlineLimit int) inter
 		}
 		return vals
 	}
+}
+
+// bindsAsClob reports whether column col binds as a CLOB. Defaults to false
+// when the decision was never resolved, which is the plain-string bind the
+// non-ingest paths have always used.
+func (s *statementImpl) bindsAsClob(col int) bool {
+	return col < len(s.clobBinds) && s.clobBinds[col]
+}
+
+// resolveStringBinds fixes, per column, how string values are bound for the
+// whole ingest.
+//
+// This cannot be decided per batch. The INSERT is prepared once and reused for
+// every batch, and switching a parameter from a plain string bind to a
+// go_ora.Clob bind between two executes of one prepared statement
+// desynchronizes go-ora's TTC stream: the next execute fails with ORA-03106
+// "fatal two-task communication protocol error", or ORA-03146 "invalid buffer
+// length for TTC field". Varying the Clob width across executes is fine, and
+// so is going from Clob to string; only string to Clob breaks. Picking from
+// each batch's widest value, as this used to, flips exactly that way the first
+// time a narrow batch is followed by a wide one.
+//
+// The destination column type is the input, since that is what the bind has to
+// satisfy. For a table this ingest just created, colTypes is that type. Append
+// and create-append can land on a table that already exists and disagrees, so
+// there the table itself is asked. Neither available means no information, and
+// the conservative answer is the CLOB bind: Oracle accepts it into VARCHAR2
+// and CLOB columns alike and at any width, where a string bind fails outright
+// on a value past the negotiated varchar limit.
+func (s *statementImpl) resolveStringBinds(ctx context.Context, tableName string, schema *arrow.Schema, mode string, colTypes []string) []bool {
+	binds := make([]bool, schema.NumFields())
+
+	stringCols := false
+	for _, f := range schema.Fields() {
+		switch f.Type.ID() {
+		case arrow.STRING, arrow.LARGE_STRING, arrow.STRING_VIEW:
+			stringCols = true
+		}
+	}
+	if !stringCols {
+		return binds
+	}
+
+	// A table created moments ago by this ingest is exactly colTypes, so skip
+	// the round trip. The other modes may be appending to someone else's
+	// table, where only the server knows.
+	if mode == adbc.OptionValueIngestModeCreate || mode == adbc.OptionValueIngestModeReplace {
+		if lobs := clobBindsFromColTypes(schema, colTypes); lobs != nil {
+			return lobs
+		}
+	}
+
+	if lobs, err := s.lobColumnsOfTable(ctx, tableName, schema); err == nil {
+		return lobs
+	} else if lobs := clobBindsFromColTypes(schema, colTypes); lobs != nil {
+		return lobs
+	} else {
+		// No information. Bind every string column as a CLOB: slower, because
+		// Oracle allocates a temporary LOB per row, but it cannot corrupt the
+		// stream or reject a wide value.
+		if s.cnxn.Logger != nil {
+			s.cnxn.Logger.Warn("oracle ingest: cannot read destination column types, binding all string columns as CLOB",
+				"table", tableName, "error", err)
+		}
+		for i, f := range schema.Fields() {
+			switch f.Type.ID() {
+			case arrow.STRING, arrow.LARGE_STRING, arrow.STRING_VIEW:
+				binds[i] = true
+			}
+		}
+		return binds
+	}
+}
+
+// clobBindsFromColTypes reads the decision out of resolved DDL types, or
+// returns nil when there are none to read.
+func clobBindsFromColTypes(schema *arrow.Schema, colTypes []string) []bool {
+	if len(colTypes) != schema.NumFields() {
+		return nil
+	}
+	binds := make([]bool, schema.NumFields())
+	for i := range colTypes {
+		binds[i] = isClobDDLType(colTypes[i])
+	}
+	return binds
+}
+
+// isClobDDLType reports whether a resolved DDL type is a character LOB.
+func isClobDDLType(ddl string) bool {
+	switch strings.ToUpper(strings.TrimSpace(ddl)) {
+	case "CLOB", "NCLOB":
+		return true
+	}
+	return false
+}
+
+// lobColumnsOfTable asks the server which of the target table's columns are
+// character LOBs, matched by name to the bound schema.
+//
+// The table is described with a no-row SELECT rather than ALL_TAB_COLUMNS:
+// tableName is whatever the INSERT already uses, so this needs no owner
+// resolution or identifier parsing to agree with it. It does need SELECT on
+// the table, which an INSERT-only grant would not include; that failure is the
+// caller's cue to fall back.
+func (s *statementImpl) lobColumnsOfTable(ctx context.Context, tableName string, schema *arrow.Schema) ([]bool, error) {
+	sess, err := s.cnxn.session(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := sess.QueryContext(ctx, "SELECT * FROM "+tableName+" WHERE 1 = 0")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+	lob := make(map[string]bool, len(colTypes))
+	for _, ct := range colTypes {
+		lob[strings.ToUpper(ct.Name())] = isClobColumnTypeName(ct.DatabaseTypeName())
+	}
+
+	binds := make([]bool, schema.NumFields())
+	for i, f := range schema.Fields() {
+		binds[i] = lob[strings.ToUpper(f.Name)]
+	}
+	return binds, nil
+}
+
+// isClobColumnTypeName reports whether a column type name from a result set
+// denotes a character LOB. go-ora reports TNS wire names (OCIClobLocator)
+// alongside the DDL names, the same split oracleTypeToArrow handles.
+func isClobColumnTypeName(name string) bool {
+	switch strings.ToUpper(name) {
+	case "CLOB", "NCLOB", "OCICLOBLOCATOR":
+		return true
+	}
+	return false
 }
 
 // intColumnToSlice converts any fixed-width integer Arrow array to NullInt64s.
@@ -1099,35 +1251,36 @@ func intColumnToSlice[T int64 | int32 | int16 | int8 | uint32 | uint16 | uint8](
 
 // stringColumnToSlice deep-copies string values (see aliasing note above).
 //
-// Batches whose widest value exceeds the VARCHAR2 cap bind as go_ora.Clob:
-// plain string binds ride go-ora's negotiated varchar limit (4000 bytes on
-// MAX_STRING_SIZE=STANDARD servers, 32767 on EXTENDED), so a wide value could
-// fail at bind time even though the destination column is CLOB. The bind type
-// is chosen per batch — narrow batches keep the cheaper varchar bind, which
-// Oracle implicitly converts into CLOB columns.
+// asClob picks the bind, and it comes from the destination column type rather
+// than from this batch's data: see resolveStringBinds for why the choice has
+// to be the same for every batch of an ingest.
+//
+// A CLOB column needs the go_ora.Clob bind because a plain string bind rides
+// go-ora's negotiated varchar limit (4000 bytes on MAX_STRING_SIZE=STANDARD
+// servers, 32767 on EXTENDED) and a wider value fails at bind time. A VARCHAR2
+// column never needs it: resolveColumnTypes clamps the declared width to that
+// same limit, so any value the column can hold is a value the string bind can
+// carry, and the string bind is the cheap array one.
 func stringColumnToSlice(a interface {
 	arrow.Array
 	Value(int) string
-}, start, end, inlineLimit int) interface{} {
+}, start, end int, asClob bool) interface{} {
+	if asClob {
+		lobs := make([]go_ora.Clob, end-start)
+		for i := start; i < end; i++ {
+			if !a.IsNull(i) {
+				lobs[i-start] = go_ora.Clob{String: strings.Clone(a.Value(i)), Valid: true}
+			}
+		}
+		return lobs
+	}
 	vals := make([]sql.NullString, end-start)
-	maxWidth := 0
 	for i := start; i < end; i++ {
 		if !a.IsNull(i) {
-			v := strings.Clone(a.Value(i))
-			if len(v) > maxWidth {
-				maxWidth = len(v)
-			}
-			vals[i-start] = sql.NullString{String: v, Valid: true}
+			vals[i-start] = sql.NullString{String: strings.Clone(a.Value(i)), Valid: true}
 		}
 	}
-	if maxWidth <= inlineLimit {
-		return vals
-	}
-	lobs := make([]go_ora.Clob, len(vals))
-	for i, v := range vals {
-		lobs[i] = go_ora.Clob{String: v.String, Valid: v.Valid}
-	}
-	return lobs
+	return vals
 }
 
 // binaryColumnToSlice deep-copies binary values (see aliasing note above).
@@ -1443,8 +1596,9 @@ func arrayDataSize(data arrow.ArrayData) int64 {
 // widths may be nil when no scan ran (forced types, or scan disabled).
 // inlineLimit is the VARCHAR2 byte cap for this server (maxInlineStringBytes on
 // STANDARD, maxExtendedStringBytes on EXTENDED); columns wider than it become
-// CLOB. It must match the value threaded into stringColumnToSlice so the DDL
-// type and the per-batch bind type agree.
+// CLOB. Keeping the declared width within that cap is also what lets the bind
+// follow the column type: any value a VARCHAR2 column accepts is one the plain
+// string bind can carry. See resolveStringBinds.
 // varcharDeclWidth picks a VARCHAR2 declared width from the observed max byte
 // width of a column's data. It adds headroom (values beyond the type-scan
 // window aren't measured — same trust the CLOB threshold already relies on)

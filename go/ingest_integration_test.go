@@ -17,6 +17,7 @@ package oracle
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -445,5 +446,80 @@ func TestIntegration_IngestMultiBatchScan(t *testing.T) {
 	}
 	if res.rows[0][2] != "9000" {
 		t.Errorf("max payload = %v, want 9000", res.rows[0][2])
+	}
+}
+
+// A stream whose first batch is narrow and whose second is wide used to fail:
+// the bind type was chosen from each batch's widest value, so the reused
+// prepared statement saw a plain string bind and then a go_ora.Clob bind, and
+// go-ora's TTC stream desynchronized (ORA-03106, or ORA-03146 on single-row
+// batches). The bind now follows the destination column type, so it is the
+// same for every batch.
+//
+// Ordered narrow-first on purpose. Clob-then-string was always fine; only
+// string-then-Clob broke, so reversing the batches hides the bug.
+func TestIntegration_IngestNarrowBatchThenWideBatch(t *testing.T) {
+	cnxn, query := openTestConnection(t)
+	table := "ADBC_TEST_NARROW_THEN_WIDE"
+	execTestSQL(t, cnxn, "DROP TABLE "+table+" PURGE")
+	t.Cleanup(func() { execTestSQL(t, cnxn, "DROP TABLE "+table+" PURGE") })
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "payload", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+
+	mk := func(id int64, payload string) arrow.RecordBatch {
+		b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+		defer b.Release()
+		b.Field(0).(*array.Int64Builder).AppendValues([]int64{id}, nil)
+		b.Field(1).(*array.StringBuilder).AppendValues([]string{payload}, nil)
+		return b.NewRecord()
+	}
+
+	// Widths straddling the STANDARD inline cap, in increasing order, with a
+	// null and a narrow value after the wide one so the bind has to hold for
+	// every batch rather than just widen once.
+	widths := []int{4, 100, 12000, 9000, 20, 40000}
+	var recs []arrow.RecordBatch
+	for i, w := range widths {
+		recs = append(recs, mk(int64(i), strings.Repeat("x", w)))
+	}
+	recs = append(recs, mk(int64(len(widths)), ""))
+	defer func() {
+		for _, r := range recs {
+			r.Release()
+		}
+	}()
+
+	// Scan window of 1 byte: auto-sizing sees only the first narrow batch, so
+	// the column must be forced, exactly as a real stream with wide values
+	// beyond the window would need.
+	opts := map[string]string{OptionIngestClobColumns: "payload"}
+	affected, err := ingestStream(t, cnxn, table, adbc.OptionValueIngestModeCreate, opts, schema, recs)
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if want := int64(len(recs)); affected != want {
+		t.Errorf("affected = %d, want %d", affected, want)
+	}
+
+	res := query(`SELECT COUNT(*), MAX(DBMS_LOB.GETLENGTH("PAYLOAD")) FROM ` + table)
+	if res.err != nil {
+		t.Fatalf("verify query: %v", res.err)
+	}
+	if got, want := res.rows[0][0], strconv.Itoa(len(recs)); got != want {
+		t.Errorf("row count = %v, want %v", got, want)
+	}
+	if res.rows[0][1] != "40000" {
+		t.Errorf("max payload length = %v, want 40000", res.rows[0][1])
+	}
+
+	// Every width must have round-tripped exactly, not just the widest.
+	for i, w := range widths {
+		res := query(`SELECT DBMS_LOB.GETLENGTH("PAYLOAD") FROM ` + table + ` WHERE "ID" = ` + strconv.Itoa(i))
+		if res.err != nil || len(res.rows) != 1 || res.rows[0][0] != strconv.Itoa(w) {
+			t.Errorf("id=%d payload length: rows=%v err=%v, want %d", i, res.rows, res.err, w)
+		}
 	}
 }
