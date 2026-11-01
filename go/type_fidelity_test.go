@@ -16,6 +16,7 @@ package oracle
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math"
 	"testing"
@@ -209,5 +210,162 @@ func ingestBatch(ctx context.Context, t *testing.T, cnxn adbc.Connection, table 
 	}
 	if _, err := stmt.ExecuteUpdate(ctx); err != nil {
 		t.Fatalf("ingest into %s: %v", table, err)
+	}
+}
+
+// --- TIMESTAMP precision ---
+
+func TestArrowTimeUnit(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   arrow.TimeUnit
+		wantOK bool
+	}{
+		{"", arrow.Microsecond, true}, // unset means the default
+		{TimestampUnitMicro, arrow.Microsecond, true},
+		{TimestampUnitNano, arrow.Nanosecond, true},
+		{"ms", 0, false},
+		{"s", 0, false},
+		{"nanoseconds", 0, false},
+	}
+	for _, tc := range cases {
+		got, ok := arrowTimeUnit(tc.in)
+		if ok != tc.wantOK {
+			t.Errorf("arrowTimeUnit(%q) ok = %v, want %v", tc.in, ok, tc.wantOK)
+			continue
+		}
+		if ok && got != tc.want {
+			t.Errorf("arrowTimeUnit(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+	if defaultTimestampUnit != TimestampUnitMicro {
+		t.Errorf("defaultTimestampUnit = %q, want %q", defaultTimestampUnit, TimestampUnitMicro)
+	}
+}
+
+// The unit is a connection policy, so both schema paths must honour it and
+// DATE must ignore it: Oracle DATE has second granularity, so microseconds is
+// always lossless for it.
+func TestTypePolicyTimestampUnit(t *testing.T) {
+	for _, tc := range []struct {
+		unit arrow.TimeUnit
+		name string
+	}{{arrow.Microsecond, "us"}, {arrow.Nanosecond, "ns"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			pol := typePolicy{timestampUnit: tc.unit}
+
+			naive := pol.oracleTimestamp(false).(*arrow.TimestampType)
+			if naive.Unit != tc.unit || naive.TimeZone != "" {
+				t.Errorf("naive = %s, want unit %v and no zone", naive, tc.unit)
+			}
+			zoned := pol.oracleTimestamp(true).(*arrow.TimestampType)
+			if zoned.Unit != tc.unit || zoned.TimeZone != "UTC" {
+				t.Errorf("zoned = %s, want unit %v and UTC", zoned, tc.unit)
+			}
+
+			// DATE goes through neither, so it stays microseconds.
+			date := oracleDataTypeToArrow("DATE", sql.NullInt64{}, sql.NullInt64{},
+				typePolicy{timestampUnit: tc.unit}).(*arrow.TimestampType)
+			if date.Unit != arrow.Microsecond || date.TimeZone != "" {
+				t.Errorf("DATE = %s, want timestamp[us] regardless of the unit policy", date)
+			}
+		})
+	}
+
+	// A zero policy must not produce a zero unit, which would be seconds.
+	if got := (typePolicy{}).oracleTimestamp(false).(*arrow.TimestampType).Unit; got != arrow.Microsecond {
+		t.Errorf("zero policy unit = %v, want microsecond", got)
+	}
+}
+
+// TIMESTAMP(9) keeps all nine digits only under the nanosecond unit. Under the
+// default it truncates to microseconds, which is what Oracle's own default
+// precision holds anyway.
+func TestIntegration_TimestampNanoPrecision(t *testing.T) {
+	const table = "ADBC_T33_NANOS"
+	// 123456789 nanoseconds: the last three digits are what microseconds drop.
+	const literal = "TIMESTAMP '2024-06-01 12:00:00.123456789'"
+
+	cases := []struct {
+		unit      string
+		wantType  string
+		wantNanos int
+	}{
+		{TimestampUnitMicro, "timestamp[us]", 123456000},
+		{TimestampUnitNano, "timestamp[ns]", 123456789},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.unit, func(t *testing.T) {
+			ctx, cnxn := openTypedConnection(t, map[string]string{OptionTimestampUnit: tc.unit})
+			dropTable(ctx, t, cnxn, table)
+			execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+" (T TIMESTAMP(9))")
+			defer dropTable(ctx, t, cnxn, table)
+			execUpdate(ctx, t, cnxn, "INSERT INTO "+table+" VALUES ("+literal+")")
+
+			schema, rec := readOneRow(ctx, t, cnxn, "SELECT T FROM "+table)
+			defer rec.Release()
+
+			if got := schema.Field(0).Type.String(); got != tc.wantType {
+				t.Errorf("type = %s, want %s", got, tc.wantType)
+			}
+			col := rec.Column(0).(*array.Timestamp)
+			ts := col.Value(0)
+			got := ts.ToTime(schema.Field(0).Type.(*arrow.TimestampType).Unit)
+			if got.Nanosecond() != tc.wantNanos {
+				t.Errorf("nanoseconds = %d, want %d (value %s)", got.Nanosecond(), tc.wantNanos, got)
+			}
+			// The whole-second part must be right either way.
+			if got.Year() != 2024 || got.Month() != 6 || got.Day() != 1 || got.Hour() != 12 {
+				t.Errorf("wall clock = %s, want 2024-06-01 12:00", got)
+			}
+		})
+	}
+}
+
+// Values on both sides of a DST transition must survive a TIMESTAMP WITH TIME
+// ZONE round trip as the same instant. The zone is normalised to UTC on the
+// way out, so the test compares instants rather than wall clocks.
+func TestIntegration_TimestampWithTimeZoneDSTBoundary(t *testing.T) {
+	ctx, cnxn := openTypedConnection(t, nil)
+
+	const table = "ADBC_T33_DST"
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+" (ID NUMBER(10), T TIMESTAMP(6) WITH TIME ZONE)")
+	defer dropTable(ctx, t, cnxn, table)
+
+	// US spring-forward 2024-03-10 02:00 and fall-back 2024-11-03 02:00, taken
+	// either side of each jump so both offsets are exercised.
+	cases := []struct {
+		id      int
+		literal string
+		wantUTC string
+	}{
+		{1, "TIMESTAMP '2024-03-10 01:59:59 America/New_York'", "2024-03-10T06:59:59Z"},
+		{2, "TIMESTAMP '2024-03-10 03:00:00 America/New_York'", "2024-03-10T07:00:00Z"},
+		{3, "TIMESTAMP '2024-11-03 00:59:59 America/New_York'", "2024-11-03T04:59:59Z"},
+		{4, "TIMESTAMP '2024-11-03 03:00:00 America/New_York'", "2024-11-03T08:00:00Z"},
+	}
+	for _, c := range cases {
+		execUpdate(ctx, t, cnxn, fmt.Sprintf(
+			"INSERT INTO %s VALUES (%d, %s)", table, c.id, c.literal))
+	}
+
+	schema, rec := readOneRow(ctx, t, cnxn, `SELECT "T" FROM `+table+` ORDER BY "ID"`)
+	defer rec.Release()
+
+	tsType := schema.Field(0).Type.(*arrow.TimestampType)
+	if tsType.TimeZone != "UTC" {
+		t.Fatalf("type = %s, want a UTC-normalised timestamp", tsType)
+	}
+	col := rec.Column(0).(*array.Timestamp)
+	if col.Len() != len(cases) {
+		t.Fatalf("got %d rows, want %d", col.Len(), len(cases))
+	}
+	for i, c := range cases {
+		got := col.Value(i).ToTime(tsType.Unit).UTC().Format("2006-01-02T15:04:05Z")
+		if got != c.wantUTC {
+			t.Errorf("row %d (%s): got %s, want %s", c.id, c.literal, got, c.wantUTC)
+		}
 	}
 }

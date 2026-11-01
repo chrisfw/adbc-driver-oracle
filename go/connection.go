@@ -67,8 +67,21 @@ type connectionImpl struct {
 	// concrete value by databaseImpl.effectiveNumberMapping.
 	numberMapping string
 
+	// timestampUnit is the Arrow unit for TIMESTAMP columns, resolved by
+	// databaseImpl.effectiveTimestampUnit.
+	timestampUnit arrow.TimeUnit
+
 	varcharOnce  sync.Once
 	varcharLimit int // cached inline VARCHAR2 byte cap; see inlineStringLimit
+}
+
+// typePolicy returns the resolved type-mapping configuration both schema
+// paths must use.
+func (c *connectionImpl) typePolicy() typePolicy {
+	return typePolicy{
+		numberMapping: c.numberMapping,
+		timestampUnit: c.timestampUnit,
+	}
 }
 
 // sessionExecutor is the subset of *sql.Conn and *sql.Tx that statements and
@@ -522,7 +535,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 			return nil, err
 		}
 
-		arrowType := oracleDataTypeToArrow(dataType, prec, scale, c.numberMapping)
+		arrowType := oracleDataTypeToArrow(dataType, prec, scale, c.typePolicy())
 		fields = append(fields, arrow.Field{
 			Name:     name,
 			Type:     arrowType,
@@ -712,7 +725,7 @@ func (c *connectionImpl) Close() error {
 // same column, or GetTableSchema describes a table that ExecuteQuery does not
 // return, so both send NUMBER through numberToArrow rather than reimplementing
 // the policy.
-func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, numberMapping string) arrow.DataType {
+func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, pol typePolicy) arrow.DataType {
 	dt := strings.ToUpper(dataType)
 	switch {
 	// FLOAT is an ANSI synonym stored as NUMBER, and go-ora reports it as
@@ -722,7 +735,7 @@ func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, numb
 	// IEEE floats, are reported as themselves, and stay Float64.
 	case dt == "NUMBER" || dt == "FLOAT":
 		p, s, ok := decimalSizeFromMetadata(precision, scale)
-		return numberToArrow(p, s, ok, numberMapping)
+		return numberToArrow(p, s, ok, pol.numberMapping)
 	case dt == "BINARY_FLOAT":
 		return arrow.PrimitiveTypes.Float32
 	case dt == "BINARY_DOUBLE":
@@ -731,10 +744,18 @@ func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64, numb
 		dt == "CHAR" || dt == "NCHAR" || dt == "CLOB" || dt == "NCLOB" ||
 		dt == "LONG" || dt == "ROWID":
 		return arrow.BinaryTypes.String
-	case dt == "DATE" || dt == "TIMESTAMP":
+	// Oracle DATE has second granularity, so microseconds is always lossless
+	// for it and the unit policy does not apply.
+	case dt == "DATE":
 		return timestampNoTZ
+	// ALL_TAB_COLUMNS spells the declared precision into DATA_TYPE, so the
+	// name here is "TIMESTAMP(6)" or "TIMESTAMP(9) WITH LOCAL TIME ZONE" and
+	// never a bare "TIMESTAMP". An exact match for the bare name therefore
+	// never fired, and every naive TIMESTAMP fell through to the zoned branch:
+	// GetTableSchema announced timestamp[us, tz=UTC] for a column ExecuteQuery
+	// returns as naive.
 	case strings.HasPrefix(dt, "TIMESTAMP"):
-		return arrow.FixedWidthTypes.Timestamp_us
+		return pol.oracleTimestamp(strings.Contains(dt, "TIME ZONE"))
 	case strings.HasPrefix(dt, "INTERVAL"):
 		return arrow.BinaryTypes.String
 	case dt == "RAW" || dt == "LONG RAW" || dt == "BLOB":

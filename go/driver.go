@@ -20,6 +20,7 @@ import (
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
@@ -68,6 +69,10 @@ const (
 	// while sizing string columns (default 64 MiB).
 	OptionIngestTypeScanLimit = "oracle.ingest.type_scan_limit_bytes"
 
+	// timestamp_unit selects the Arrow time unit for TIMESTAMP columns. See
+	// the TimestampUnit* constants. Defaults to microseconds.
+	OptionTimestampUnit = "oracle.timestamp_unit"
+
 	// number_mapping selects how Oracle NUMBER columns are typed in the
 	// result Arrow schema. See the NumberMapping* constants. Defaults to
 	// NumberMappingDecimal, which preserves every digit Oracle stores.
@@ -103,6 +108,8 @@ const (
 
 	// defaultNumberMapping is what an unset oracle.number_mapping means.
 	//
+	// (See TimestampUnit* below for the other type policy.)
+	//
 	// Decimal rather than float, which is a deliberate departure from the
 	// upstream driver. Oracle NUMBER is base-10 with up to 38 significant
 	// digits and go-ora hands it over as a full-precision decimal string, so
@@ -111,6 +118,49 @@ const (
 	// summing correctly. Callers who want the old shape can still ask for it.
 	defaultNumberMapping = NumberMappingDecimal
 )
+
+// Accepted values for OptionTimestampUnit.
+//
+// Oracle TIMESTAMP(p) carries up to 9 fractional digits, more than a
+// microsecond Arrow timestamp holds. The declared p cannot drive the choice,
+// though: go-ora reports one wire type for every TIMESTAMP precision and
+// exposes no scale for it, so only the data dictionary knows p. Selecting ns
+// from the dictionary would make GetTableSchema disagree with ExecuteQuery,
+// which is the defect 2.1 exists to prevent, so the unit is a connection
+// policy both paths read instead.
+const (
+	// TimestampUnitMicro is the default. Lossless for DATE and for TIMESTAMP
+	// up to p=6, which is Oracle's own default precision, and it spans the
+	// whole Oracle date range.
+	TimestampUnitMicro = "us"
+
+	// TimestampUnitNano keeps all 9 digits of a TIMESTAMP(7..9).
+	//
+	// Opt-in because a nanosecond Arrow timestamp only spans 1677-09-21 to
+	// 2262-04-11, and values outside it do not fail: arrow.TimestampFromTime
+	// wraps silently, so a year-1500 date becomes a plausible-looking wrong
+	// instant. Only choose this when the data is known to sit inside that
+	// window.
+	TimestampUnitNano = "ns"
+
+	// defaultTimestampUnit is what an unset oracle.timestamp_unit means.
+	defaultTimestampUnit = TimestampUnitMicro
+)
+
+// arrowTimeUnit maps an OptionTimestampUnit value to its Arrow unit. An empty
+// value means the option was never set.
+func arrowTimeUnit(val string) (arrow.TimeUnit, bool) {
+	if val == "" {
+		val = defaultTimestampUnit
+	}
+	switch val {
+	case TimestampUnitMicro:
+		return arrow.Microsecond, true
+	case TimestampUnitNano:
+		return arrow.Nanosecond, true
+	}
+	return 0, false
+}
 
 var infoVendorVersion string
 

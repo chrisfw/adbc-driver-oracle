@@ -286,8 +286,8 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 	}
 
 	impl := &oracleRecordReader{
-		rows:          rows,
-		numberMapping: s.cnxn.numberMapping,
+		rows:   rows,
+		policy: s.cnxn.typePolicy(),
 	}
 
 	var rr driverbase.BaseRecordReader
@@ -1856,9 +1856,8 @@ type oracleRecordReader struct {
 	firstRow    []interface{}
 	hasFirstRow bool
 
-	// numberMapping is the NUMBER→Arrow policy for this result set.
-	// Empty behaves as defaultNumberMapping.
-	numberMapping string
+	// policy is the connection's resolved type-mapping configuration.
+	policy typePolicy
 }
 
 func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.RecordBatch, rowIdx int) (*arrow.Schema, error) {
@@ -1900,7 +1899,7 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 		} else {
 			fields[i] = arrow.Field{
 				Name:     ct.Name(),
-				Type:     oracleTypeToArrow(ct, r.numberMapping),
+				Type:     oracleTypeToArrow(ct, r.policy),
 				Nullable: nullable,
 			}
 		}
@@ -2022,6 +2021,31 @@ func (r *oracleRecordReader) Close() error {
 
 var timestampNoTZ = &arrow.TimestampType{Unit: arrow.Microsecond}
 
+// typePolicy is the connection's resolved type-mapping configuration.
+//
+// Both schema paths read the same value, which is what keeps GetTableSchema
+// and ExecuteQuery describing a column identically. Passed as one struct
+// rather than as separate arguments because every policy added here has to
+// reach both, and a missed argument is exactly how they drift apart.
+type typePolicy struct {
+	numberMapping string
+	timestampUnit arrow.TimeUnit
+}
+
+// oracleTimestamp builds the Arrow type for an Oracle TIMESTAMP under this
+// policy. zoned covers both WITH TIME ZONE and WITH LOCAL TIME ZONE, which are
+// normalised to UTC on the way out.
+func (p typePolicy) oracleTimestamp(zoned bool) arrow.DataType {
+	unit := p.timestampUnit
+	if unit == 0 {
+		unit = arrow.Microsecond
+	}
+	if zoned {
+		return &arrow.TimestampType{Unit: unit, TimeZone: "UTC"}
+	}
+	return &arrow.TimestampType{Unit: unit}
+}
+
 // oracleScaleSentinel is what go-ora reports for a NUMBER whose scale arrived
 // as Oracle's -127 "floating" sentinel — that is, an unconstrained NUMBER, or
 // the result of an arithmetic expression. go-ora stores scale in a uint8 and
@@ -2039,7 +2063,7 @@ const oracleScaleSentinel = 255
 // maximum precision, so every *constrained* NUMBER fits.
 const maxDecimal128Precision = 38
 
-func oracleTypeToArrow(ct *sql.ColumnType, numberMapping string) arrow.DataType {
+func oracleTypeToArrow(ct *sql.ColumnType, pol typePolicy) arrow.DataType {
 	dbType := strings.ToUpper(ct.DatabaseTypeName())
 
 	// Note: go-ora's ColumnType.DatabaseTypeName returns TNS wire-type names
@@ -2048,7 +2072,7 @@ func oracleTypeToArrow(ct *sql.ColumnType, numberMapping string) arrow.DataType 
 	switch {
 	case dbType == "NUMBER":
 		precision, scale, ok := ct.DecimalSize()
-		return numberToArrow(precision, scale, ok, numberMapping)
+		return numberToArrow(precision, scale, ok, pol.numberMapping)
 	// BINARY_FLOAT is an IEEE single and go-ora decodes it to a Go float32,
 	// so widening it to Float64 only invented precision the column never had
 	// and doubled the width of every value.
@@ -2066,13 +2090,15 @@ func oracleTypeToArrow(ct *sql.ColumnType, numberMapping string) arrow.DataType 
 		dbType == "OCICLOBLOCATOR":
 		return arrow.BinaryTypes.String
 
+	// Oracle DATE has second granularity, so microseconds is always lossless
+	// for it and the unit policy does not apply.
 	case dbType == "DATE":
 		return timestampNoTZ
 	case dbType == "TIMESTAMPDTY" || dbType == "TIMESTAMP":
-		return timestampNoTZ
+		return pol.oracleTimestamp(false)
 	case dbType == "TIMESTAMPTZ_DTY" || dbType == "TIMESTAMPLTZ_DTY" ||
 		strings.HasPrefix(dbType, "TIMESTAMP"):
-		return arrow.FixedWidthTypes.Timestamp_us
+		return pol.oracleTimestamp(true)
 
 	case strings.HasPrefix(dbType, "INTERVAL"):
 		return arrow.BinaryTypes.String

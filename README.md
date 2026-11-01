@@ -156,6 +156,28 @@ arithmetic. Either `CAST` in SQL to give the column a declared type, or set
 including for `FLOAT`, which Oracle stores as `NUMBER`. `BINARY_FLOAT` and
 `BINARY_DOUBLE` are genuine IEEE floats and are unaffected by this option.
 
+## TIMESTAMP precision
+
+`oracle.timestamp_unit` selects the Arrow time unit for `TIMESTAMP` columns:
+`us` (default) or `ns`. Oracle `DATE` has second granularity and is always
+microseconds, whatever this is set to.
+
+It is a connection-wide policy rather than being derived from each column's
+declared `TIMESTAMP(p)`, and that is forced by go-ora: it reports one wire type
+for every TIMESTAMP precision and exposes no scale for it, so only the data
+dictionary knows `p`. Choosing the unit per column from the dictionary would
+make `GetTableSchema` describe a column differently from the batches
+`ExecuteQuery` returns for it, which is the class of bug this driver has
+deliberately eliminated.
+
+`us` is lossless for `DATE` and for `TIMESTAMP` up to `p=6`, which is Oracle's
+own default precision, and it covers Oracle's whole date range. Set `ns` to
+keep all nine digits of a `TIMESTAMP(7..9)`, but note that a nanosecond Arrow
+timestamp spans only **1677-09-21 to 2262-04-11**, and values outside it do not
+fail: Arrow wraps them silently, so a year-1500 date becomes a plausible but
+wrong instant. Only choose `ns` when the data is known to fall inside that
+window.
+
 ## Connections and sessions
 
 Each ADBC connection owns one Oracle session for its whole life, checked out of
@@ -223,10 +245,10 @@ Two Oracle behaviours to know about in transactional mode:
 | BINARY_FLOAT | Float32 | IEEE single, not widened |
 | BINARY_DOUBLE | Float64 | |
 | VARCHAR2, CHAR, CLOB, NVARCHAR2, NCHAR, NCLOB | String | |
-| DATE | Timestamp (us, no TZ) | Oracle DATE is wall-clock time |
-| TIMESTAMP | Timestamp (us, no TZ) | |
-| TIMESTAMP WITH TIME ZONE | Timestamp (us, UTC) | |
-| TIMESTAMP WITH LOCAL TIME ZONE | Timestamp (us, UTC) | |
+| DATE | Timestamp (us, no TZ) | Oracle DATE is wall-clock time; always us |
+| TIMESTAMP(p) | Timestamp (us or ns, no TZ) | Unit from `oracle.timestamp_unit` |
+| TIMESTAMP(p) WITH TIME ZONE | Timestamp (us or ns, UTC) | Normalised to UTC |
+| TIMESTAMP(p) WITH LOCAL TIME ZONE | Timestamp (us or ns, UTC) | Normalised to UTC |
 | INTERVAL YEAR TO MONTH | String | e.g. `+03-06` |
 | INTERVAL DAY TO SECOND | String | e.g. `+05 04:03:02.000000` |
 | RAW, BLOB | Binary | |

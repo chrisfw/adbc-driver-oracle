@@ -27,6 +27,7 @@ import (
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
+	"github.com/apache/arrow-go/v18/arrow"
 	go_ora "github.com/sijms/go-ora/v2"
 )
 
@@ -48,8 +49,12 @@ type databaseImpl struct {
 	ingestWorkers int // Parallel insert workers (default: 1)
 
 	// numberMapping selects the Arrow type for NUMBER result columns.
-	// Empty means NumberMappingFloat. See OptionNumberMapping.
+	// Empty means defaultNumberMapping. See OptionNumberMapping.
 	numberMapping string
+
+	// timestampUnit selects the Arrow time unit for TIMESTAMP result columns.
+	// Empty means defaultTimestampUnit. See OptionTimestampUnit.
+	timestampUnit string
 
 	// Connection pool — shared across all Open() calls.
 	// sql.DB is already a pool internally; we create it once and reuse.
@@ -96,6 +101,13 @@ func (db *databaseImpl) SetOption(key string, val string) error {
 				OptionNumberMapping, val,
 				NumberMappingFloat, NumberMappingDecimal, NumberMappingString)
 		}
+	case OptionTimestampUnit:
+		if _, ok := arrowTimeUnit(val); !ok {
+			return db.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"invalid %s %q: expected %q or %q",
+				OptionTimestampUnit, val, TimestampUnitMicro, TimestampUnitNano)
+		}
+		db.timestampUnit = val
 	default:
 		return db.DatabaseImplBase.SetOption(key, val)
 	}
@@ -125,6 +137,8 @@ func (db *databaseImpl) GetOption(key string) (string, error) {
 		return db.walletLocation, nil
 	case OptionNumberMapping:
 		return db.effectiveNumberMapping(), nil
+	case OptionTimestampUnit:
+		return db.effectiveTimestampUnit(), nil
 	default:
 		return db.DatabaseImplBase.GetOption(key)
 	}
@@ -137,6 +151,21 @@ func (db *databaseImpl) effectiveNumberMapping() string {
 		return defaultNumberMapping
 	}
 	return db.numberMapping
+}
+
+// effectiveArrowTimeUnit resolves the configured unit to its Arrow value.
+// SetOption already rejected anything unrecognised, so this cannot fail.
+func (db *databaseImpl) effectiveArrowTimeUnit() arrow.TimeUnit {
+	unit, _ := arrowTimeUnit(db.timestampUnit)
+	return unit
+}
+
+// effectiveTimestampUnit resolves the unset value to the default.
+func (db *databaseImpl) effectiveTimestampUnit() string {
+	if db.timestampUnit == "" {
+		return defaultTimestampUnit
+	}
+	return db.timestampUnit
 }
 
 func (db *databaseImpl) buildDSN() string {
@@ -266,6 +295,7 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		conn:               conn,
 		ingestWorkers:      db.ingestWorkers,
 		numberMapping:      db.effectiveNumberMapping(),
+		timestampUnit:      db.effectiveArrowTimeUnit(),
 	}
 	// Transactions are begun with a context scoped to the connection, not to
 	// the statement that happens to start one: database/sql rolls a

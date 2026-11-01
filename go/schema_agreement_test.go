@@ -102,7 +102,7 @@ func TestSchemaPathsAgreeOnNumber(t *testing.T) {
 	for _, tc := range cases {
 		for _, mapping := range []string{NumberMappingFloat, NumberMappingDecimal, NumberMappingString} {
 			t.Run(tc.ddl+"/"+mapping, func(t *testing.T) {
-				meta := oracleDataTypeToArrow(tc.typeName, tc.metaPrec, tc.metaScale, mapping)
+				meta := oracleDataTypeToArrow(tc.typeName, tc.metaPrec, tc.metaScale, typePolicy{numberMapping: mapping})
 				wire := numberToArrow(tc.wirePrec, tc.wireScale, tc.wireOK, mapping)
 				if !arrow.TypeEqual(meta, wire) {
 					t.Errorf("GetTableSchema says %s but ExecuteQuery says %s", meta, wire)
@@ -123,11 +123,69 @@ func TestBinaryFloatsIgnoreNumberMapping(t *testing.T) {
 	}
 	for dt, want := range cases {
 		for _, mapping := range []string{NumberMappingFloat, NumberMappingDecimal, NumberMappingString} {
-			got := oracleDataTypeToArrow(dt, sql.NullInt64{}, sql.NullInt64{}, mapping)
+			got := oracleDataTypeToArrow(dt, sql.NullInt64{}, sql.NullInt64{}, typePolicy{numberMapping: mapping})
 			if !arrow.TypeEqual(got, want) {
 				t.Errorf("%s under %s: got %s, want %s", dt, mapping, got, want)
 			}
 		}
+	}
+}
+
+// 2.1's invariant is not only about NUMBER: every type has to describe itself
+// the same way through both paths. Temporal types are where it is easiest to
+// get wrong, because the data dictionary spells the declared precision into
+// DATA_TYPE ("TIMESTAMP(6)") while go-ora reports a single wire name
+// ("TimeStampDTY") for all of them, so a prefix match in one path and an exact
+// match in the other drift apart.
+func TestIntegration_TemporalSchemaPathsAgree(t *testing.T) {
+	ctx, cnxn := openTypedConnection(t, nil)
+
+	ddls := []string{
+		"DATE",
+		"TIMESTAMP",
+		"TIMESTAMP(0)",
+		"TIMESTAMP(3)",
+		"TIMESTAMP(6)",
+		"TIMESTAMP(9)",
+		"TIMESTAMP WITH TIME ZONE",
+		"TIMESTAMP(9) WITH TIME ZONE",
+		"TIMESTAMP WITH LOCAL TIME ZONE",
+		"TIMESTAMP(9) WITH LOCAL TIME ZONE",
+	}
+
+	for i, ddl := range ddls {
+		table := fmt.Sprintf("ADBC_T33_TS_%d", i)
+		t.Run(ddl, func(t *testing.T) {
+			dropTable(ctx, t, cnxn, table)
+			execUpdate(ctx, t, cnxn, "CREATE TABLE "+table+" (C "+ddl+")")
+			defer dropTable(ctx, t, cnxn, table)
+
+			schema, err := cnxn.GetTableSchema(ctx, nil, nil, table)
+			if err != nil {
+				t.Fatalf("GetTableSchema: %v", err)
+			}
+			metaType := schema.Field(0).Type
+
+			stmt, err := cnxn.NewStatement()
+			if err != nil {
+				t.Fatalf("NewStatement: %v", err)
+			}
+			defer stmt.Close()
+			if err := stmt.SetSqlQuery("SELECT C FROM " + table); err != nil {
+				t.Fatalf("SetSqlQuery: %v", err)
+			}
+			reader, _, err := stmt.ExecuteQuery(ctx)
+			if err != nil {
+				t.Fatalf("ExecuteQuery: %v", err)
+			}
+			defer reader.Release()
+			queryType := reader.Schema().Field(0).Type
+
+			if !arrow.TypeEqual(metaType, queryType) {
+				t.Errorf("%s: GetTableSchema says %s but ExecuteQuery says %s",
+					ddl, metaType, queryType)
+			}
+		})
 	}
 }
 
