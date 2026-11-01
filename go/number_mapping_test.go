@@ -144,19 +144,55 @@ func TestNumberToArrow(t *testing.T) {
 	}
 }
 
-// The empty mapping is what a database that never saw the option produces;
-// it must behave exactly as the documented default.
-func TestNumberToArrow_UnsetMappingMatchesFloat(t *testing.T) {
+// The empty mapping is what a reader built without a resolved policy
+// produces; it must behave exactly as the documented default, which is
+// decimal.
+func TestNumberToArrow_UnsetMappingMatchesDefault(t *testing.T) {
 	cases := []struct{ precision, scale int64 }{
 		{10, 0}, {38, 0}, {10, 2}, {38, oracleScaleSentinel},
 	}
 	for _, c := range cases {
 		unset := numberToArrow(c.precision, c.scale, true, "")
-		explicit := numberToArrow(c.precision, c.scale, true, NumberMappingFloat)
+		explicit := numberToArrow(c.precision, c.scale, true, defaultNumberMapping)
 		if !arrow.TypeEqual(unset, explicit) {
 			t.Errorf("NUMBER(%d,%d): unset mapping = %s, %q = %s",
-				c.precision, c.scale, unset, NumberMappingFloat, explicit)
+				c.precision, c.scale, unset, defaultNumberMapping, explicit)
 		}
+	}
+}
+
+// The default is decimal, not float. This is the fork's deliberate schema
+// change, so it is pinned explicitly rather than left implied by the test
+// above: a NUMBER(12,2) must arrive as an exact Decimal128 and not a float64.
+func TestDefaultNumberMappingIsDecimal(t *testing.T) {
+	if defaultNumberMapping != NumberMappingDecimal {
+		t.Fatalf("defaultNumberMapping = %q, want %q", defaultNumberMapping, NumberMappingDecimal)
+	}
+	cases := []struct {
+		name      string
+		precision int64
+		scale     int64
+		want      arrow.DataType
+	}{
+		{"NUMBER(12,2) keeps every digit", 12, 2, decimal128(12, 2)},
+		{"NUMBER(10) stays the cheaper int64", 10, 0, arrow.PrimitiveTypes.Int64},
+		{"NUMBER(38,0) is exact, not text", 38, 0, decimal128(38, 0)},
+		// Unconstrained NUMBER has no declared precision to build a decimal
+		// from, so it stays lossless as text rather than becoming a float.
+		{"unconstrained NUMBER stays lossless", 0, oracleScaleSentinel, arrow.BinaryTypes.String},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := numberToArrow(tc.precision, tc.scale, true, "")
+			if !arrow.TypeEqual(got, tc.want) {
+				t.Errorf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+
+	// And a caller who wants the old shape can still ask for it.
+	if got := numberToArrow(12, 2, true, NumberMappingFloat); !arrow.TypeEqual(got, arrow.PrimitiveTypes.Float64) {
+		t.Errorf("explicit float mapping = %s, want float64", got)
 	}
 }
 

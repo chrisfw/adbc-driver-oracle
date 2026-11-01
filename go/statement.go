@@ -1857,7 +1857,7 @@ type oracleRecordReader struct {
 	hasFirstRow bool
 
 	// numberMapping is the NUMBER→Arrow policy for this result set.
-	// Empty behaves as NumberMappingFloat.
+	// Empty behaves as defaultNumberMapping.
 	numberMapping string
 }
 
@@ -2087,6 +2087,11 @@ func oracleTypeToArrow(ct *sql.ColumnType, numberMapping string) arrow.DataType 
 // configured mapping policy. precision, scale and ok are as reported by
 // sql.ColumnType.DecimalSize. See the NumberMapping* constants.
 func numberToArrow(precision, scale int64, ok bool, numberMapping string) arrow.DataType {
+	if numberMapping == "" {
+		// Reached when a reader was built without a resolved policy. Keep it
+		// identical to the resolved default rather than quietly differing.
+		numberMapping = defaultNumberMapping
+	}
 	if numberMapping == NumberMappingString {
 		return arrow.BinaryTypes.String
 	}
@@ -2107,7 +2112,7 @@ func numberToArrow(precision, scale int64, ok bool, numberMapping string) arrow.
 		return arrow.BinaryTypes.String
 	}
 
-	// NumberMappingFloat (the default) — historical behaviour.
+	// NumberMappingFloat: the upstream driver's historical behaviour.
 	if ok && scale == 0 && precision > 18 {
 		return arrow.BinaryTypes.String
 	}

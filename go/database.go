@@ -134,7 +134,7 @@ func (db *databaseImpl) GetOption(key string) (string, error) {
 // never have to test for "".
 func (db *databaseImpl) effectiveNumberMapping() string {
 	if db.numberMapping == "" {
-		return NumberMappingFloat
+		return defaultNumberMapping
 	}
 	return db.numberMapping
 }

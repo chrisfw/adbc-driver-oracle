@@ -70,7 +70,7 @@ const (
 
 	// number_mapping selects how Oracle NUMBER columns are typed in the
 	// result Arrow schema. See the NumberMapping* constants. Defaults to
-	// NumberMappingFloat, which is the driver's historical behaviour.
+	// NumberMappingDecimal, which preserves every digit Oracle stores.
 	OptionNumberMapping = "oracle.number_mapping"
 
 	DefaultPort = "1521"
@@ -100,6 +100,16 @@ const (
 	// NumberMappingString maps every NUMBER to String. Fully lossless and
 	// schema-stable at the cost of making the column non-numeric.
 	NumberMappingString = "string"
+
+	// defaultNumberMapping is what an unset oracle.number_mapping means.
+	//
+	// Decimal rather than float, which is a deliberate departure from the
+	// upstream driver. Oracle NUMBER is base-10 with up to 38 significant
+	// digits and go-ora hands it over as a full-precision decimal string, so
+	// the old default threw away exactness that had already arrived: a
+	// NUMBER(12,2) holding a monetary amount became a float64 and stopped
+	// summing correctly. Callers who want the old shape can still ask for it.
+	defaultNumberMapping = NumberMappingDecimal
 )
 
 var infoVendorVersion string

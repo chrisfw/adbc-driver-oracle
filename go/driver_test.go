@@ -204,11 +204,64 @@ func TestIntegration_TypeMapping(t *testing.T) {
 
 	// Verify types. DATE and TIMESTAMP carry no zone in Oracle, so they map to
 	// tz-naive Arrow timestamps (wall clock); SYSTIMESTAMP is TSTZ → tz=UTC.
-	expected := []string{"float64", "float64", "utf8", "timestamp[us]", "timestamp[us, tz=UTC]", "binary"}
+	//
+	// The two numbers are String, which is worth being explicit about. Oracle
+	// reports a literal or a computed expression as NUMBER with a floating
+	// scale rather than a declared one, and the default decimal mapping has no
+	// precision and scale to build a Decimal128 from, so it keeps the value
+	// lossless as text instead of rounding it into a float. The same applies
+	// to COUNT(*), SUM() and any arithmetic. Callers who want numbers out of
+	// expressions either CAST in SQL or set oracle.number_mapping=float, which
+	// the subtest below checks still works.
+	expected := []string{"utf8", "utf8", "utf8", "timestamp[us]", "timestamp[us, tz=UTC]", "binary"}
 	for i, f := range schema.Fields() {
 		got := f.Type.String()
 		if got != expected[i] {
 			t.Errorf("field %d (%s): expected type %s, got %s", i, f.Name, expected[i], got)
+		}
+	}
+}
+
+// The float mapping is the escape hatch for the above: it is lossy for scaled
+// NUMBER but gives numeric columns for expressions, which is what the upstream
+// driver always did.
+func TestIntegration_TypeMappingFloatOptionRestoresNumbers(t *testing.T) {
+	dsn := getTestDSN(t)
+	ctx := context.Background()
+
+	drv := NewDriver(memory.DefaultAllocator)
+	db, err := drv.NewDatabase(map[string]string{
+		OptionDSN:           dsn,
+		OptionNumberMapping: NumberMappingFloat,
+	})
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+
+	cnxn, err := db.Open(ctx)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cnxn.Close()
+
+	stmt, err := cnxn.NewStatement()
+	if err != nil {
+		t.Fatalf("NewStatement: %v", err)
+	}
+	defer stmt.Close()
+	if err := stmt.SetSqlQuery("SELECT 42 AS int_val, 3.14 AS float_val, COUNT(*) AS n FROM DUAL"); err != nil {
+		t.Fatalf("SetSqlQuery: %v", err)
+	}
+	reader, _, err := stmt.ExecuteQuery(ctx)
+	if err != nil {
+		t.Fatalf("ExecuteQuery: %v", err)
+	}
+	defer reader.Release()
+
+	for i, f := range reader.Schema().Fields() {
+		if f.Type.String() != "float64" {
+			t.Errorf("field %d (%s) under the float mapping: got %s, want float64", i, f.Name, f.Type)
 		}
 	}
 }

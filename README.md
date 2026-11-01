@@ -124,6 +124,38 @@ A context deadline maps to Timeout, a cancelled context to Cancelled, and a
 transport failure with no Oracle code to 08S01. Those carry no vendor code,
 since Oracle never saw them.
 
+## NUMBER mapping
+
+`oracle.number_mapping` decides how Oracle `NUMBER` columns are typed. **The
+default is `decimal`**, which differs from the upstream driver, where it was
+`float`.
+
+| Value | NUMBER(p,0), p<=18 | NUMBER(p,s) | unconstrained NUMBER, negative scale |
+|-------|--------------------|-------------|--------------------------------------|
+| `decimal` (default) | Int64 | Decimal128(p,s) | String |
+| `float` | Int64 | Float64 | Float64 (String for integral p>18) |
+| `string` | String | String | String |
+
+Oracle `NUMBER` is base-10 with up to 38 significant digits, and go-ora hands
+it over as a full-precision decimal string, so `float` discarded exactness that
+had already arrived: a `NUMBER(12,2)` holding a monetary amount became a
+float64 and stopped summing correctly. `decimal` keeps every digit, falling
+back to String only where precision and scale cannot describe a Decimal128,
+which is unconstrained `NUMBER` and negative scales. Set `float` to get the
+previous shape back.
+
+One consequence worth knowing before you pick the default: Oracle reports a
+literal or a computed expression as `NUMBER` with a *floating* scale rather
+than a declared one, so there is no precision and scale to build a
+`Decimal128` from. Under `decimal` those columns come back as String, which is
+lossless but not numeric. That covers `SELECT 42`, `COUNT(*)`, `SUM(x)` and any
+arithmetic. Either `CAST` in SQL to give the column a declared type, or set
+`oracle.number_mapping=float`.
+
+`GetTableSchema` and `ExecuteQuery` agree on the result under every mapping,
+including for `FLOAT`, which Oracle stores as `NUMBER`. `BINARY_FLOAT` and
+`BINARY_DOUBLE` are genuine IEEE floats and are unaffected by this option.
+
 ## Connections and sessions
 
 Each ADBC connection owns one Oracle session for its whole life, checked out of
