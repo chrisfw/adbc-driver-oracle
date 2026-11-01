@@ -177,3 +177,139 @@ the read is about 72% fetch wait and the ceiling is near 1.4x. On the
 decode-bound fixture there is room, and the fast decimal parser already
 delivered 2.03x of it without touching go-ora. The criterion should be restated
 against a named fixture, or it cannot be judged.
+
+## 4.3 Parallel extract
+
+`ExecutePartitions` splits one query into slices that different connections
+read at the same time. This attacks the cost 4.1 identified as dominant: 72%
+of read wall clock is fetch wait, and a lone reader leaves the server idle
+while it decodes and idle again while it waits.
+
+### Measurement
+
+500,000 rows, five columns (`NUMBER`, `NUMBER`, `VARCHAR2(100)`, `DATE`,
+`TIMESTAMP(6)`), Oracle Free 23ai in a container on the same host as the
+client. Buffer cache warmed with a full read before timing, and a second
+serial read taken afterwards as a control. Three runs.
+
+| Readers | Wall clock | Rows/s | Speedup |
+| --- | --- | --- | --- |
+| serial | 1.17s to 1.25s | ~400,000 | 1.00x |
+| 1 slice | 1.23s to 1.29s | ~400,000 | 0.91x to 1.00x |
+| 2 slices | 451ms to 483ms | ~1,060,000 | 2.51x to 2.63x |
+| 4 slices | 258ms to 270ms | ~1,890,000 | 4.32x to 4.69x |
+| 8 slices | 277ms to 303ms | ~1,720,000 | 4.13x to 4.20x |
+
+Planning costs 16ms to 32ms when a query is split, 1ms when it is not.
+
+Three things in that table are worth reading carefully.
+
+**The 1 slice row is the control that makes the rest trustworthy.** One slice
+goes through `ExecutePartitions` and `ReadPartition` but does no splitting, and
+it lands within noise of the serial read. So the speedups below it are
+parallelism and not an artifact of a different code path.
+
+**2 slices is superlinear (2.51x), which is the expected shape for a
+latency-bound pipeline, not a measurement error.** Neither side was saturated
+in the serial case: the server waits while the client decodes, and the client
+waits while the server fetches. Two sessions fill each other's idle time, so
+both sides move from roughly half utilised towards fully utilised. This is the
+same finding as 4.1 from the other direction.
+
+**8 slices is no faster than 4.** The database shares a host with the client
+here, so past four readers they contend rather than overlap. That is why
+`oracle.partition_count` defaults to 4 instead of one per core.
+
+The control read, taken after everything else, ran 1.21x to 1.40x faster than
+the first serial read. So the cache was still warming even after a full warm-up
+pass, and the honest conservative comparison is 4 slices against the fastest
+serial read ever observed (881ms), which is 3.3x.
+
+These conditions are a low-latency loopback link. A real network would likely
+widen the gap, since there is more wait to hide; a contended server would
+narrow it. The numbers are not a promise about any other deployment.
+
+### Splitting strategies
+
+| Strategy | When | Divides the work |
+| --- | --- | --- |
+| `partition` | table is partitioned | yes, disjoint segments |
+| `rowid_range` | heap table, `DBMS_PARALLEL_EXECUTE` available | yes, disjoint block ranges |
+| `ora_hash` | otherwise | **no**, every slice scans the whole table |
+| `single` | query cannot be split safely | n/a |
+
+`ora_hash` always works and is the only rung that does not divide the work:
+total server I/O is multiplied by the slice count. The descriptor reports which
+strategy was used and why a better one was unavailable, so this is a visible
+tradeoff. `DBMS_PARALLEL_EXECUTE` turned out to work for an ordinary user with
+no extra grant, so in practice heap tables reach `rowid_range`.
+
+Two SQL facts worth recording, both verified before writing any Go:
+
+- `PARTITION (p)` must come before `AS OF SCN`. The reverse is ORA-03048.
+- ROWID's character form is base-64 encoded and its **string ordering is not
+  its ROWID ordering**. A range built from `MIN`/`MAX` of `ROWIDTOCHAR(ROWID)`
+  bracketed 72,949 of 500,000 rows and silently dropped the rest. Endpoints
+  must round-trip through `CHARTOROWID`, which is lossless: the chunker's 4
+  chunks covered exactly 500,000 rows, each once.
+
+### Snapshot consistency, and its one real limitation
+
+Every slice reads `AS OF SCN` the same value, captured once, so the union is a
+consistent snapshot. The SCN comes from the first source available:
+
+1. `DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER` (exact, current, needs EXECUTE)
+2. `V$DATABASE.CURRENT_SCN` (exact, current, needs SELECT on the view)
+3. `TIMESTAMP_TO_SCN(SYSTIMESTAMP)` (no grant, but **not current**)
+
+On a default Oracle Free install an ordinary user has neither of the first two,
+so the third is what most deployments get. It resolves through Oracle's
+timestamp-to-SCN mapping, whose granularity means the answer can be a few
+seconds old, and **an SCN from before the table's last DDL cannot be read**.
+Measured: `ORA-01466` persists for about four seconds after a `CREATE TABLE`,
+with the mapped SCN frozen across the first two polls.
+
+So the SCN is proved rather than assumed. `ExecutePartitions` describes the
+query at the SCN before issuing any descriptor; if that fails for a flashback
+reason the query is returned as a single unsplit partition with the reason
+logged. Missing FLASHBACK privilege (ORA-41900) counts as such a reason, which
+is why `SELECT FROM DUAL` works at all: nobody has FLASHBACK on `SYS.DUAL`.
+Nothing is swallowed, because the fallback runs the same query without
+flashback and a genuine permission error surfaces from there.
+
+The practical consequence: an ETL that creates a staging table, loads it and
+extracts it immediately will read unsplit unless it waits a few seconds or the
+user has one of the first two SCN sources granted.
+
+### What is not split
+
+Only a single-table `SELECT` with an optional `WHERE`. Everything else returns
+one partition. The refusals that matter are not the obviously-unsupported ones
+but the queries that stay **valid SQL while returning wrong data** when run
+several times: `ORDER BY`, `DISTINCT`, `ROWNUM`, `FETCH`, `OFFSET`, a bare
+aggregate, an analytic `OVER`. Each would be evaluated per slice.
+
+A subquery is refused for a different reason: `AS OF SCN` attaches only to the
+table in the `FROM` clause, so a subquery's own table would be read at whatever
+moment each slice happened to execute, and the slices would no longer share a
+snapshot.
+
+Recognising that shape needs a scanner, not a regexp. Go's RE2 has no negative
+lookahead, and more fundamentally a regexp cannot count parentheses, so it
+cannot distinguish a subquery's `FROM` from the outer one, nor a keyword inside
+a string literal from a clause. Both mistakes slice the query in the wrong
+place.
+
+Bound parameters are refused outright: a descriptor carries only SQL, so the
+slices would execute with unbound placeholders.
+
+### Type agreement across slices
+
+An unconstrained `NUMBER` gets its Arrow type from sampled data. Slices see
+different rows, so left to infer they would disagree with each other and with
+the schema `ExecutePartitions` returned. So the types are decided once against
+the whole table at the snapshot, and pinned into every descriptor.
+
+The integration test proves this is not vacuous. Stripped of its pinned types,
+the last slice of the fixture announces `decimal(38, 1)` for a column the
+caller was promised as `decimal(38, 4)`.

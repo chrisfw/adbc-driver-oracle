@@ -162,6 +162,21 @@ Exit criterion: at least 3x the Phase 4 baseline rows/s on the benchmark table, 
 
 ### 4.3 Parallel extract via ExecutePartitions
 
+> **DONE 2026-11-01.** Measured 4.3x to 4.7x on a 500,000 row table at four
+> slices, with the cache warmed and a single slice confirmed to match serial
+> within noise. Eight slices are no faster than four, hence the default of 4.
+> Two deviations from the plan as written, both for correctness:
+>
+> - A query that cannot be split safely returns a single partition rather than
+>   `StatusNotImplemented`, so a caller can always use this path.
+> - The SCN is validated by describing the query at it before any descriptor is
+>   issued. `TIMESTAMP_TO_SCN` is the only source an ordinary user has and it
+>   can name an SCN from before the table's last DDL, which is unreadable
+>   (ORA-01466, about four seconds after a `CREATE TABLE`). Such a query falls
+>   back to one unsplit read.
+>
+> See `docs/phase4-read-baseline.md` for the numbers.
+
 - Implement `ExecutePartitions`: given a query over a single table, split by partition (ALL_TAB_PARTITIONS), else by ROWID ranges from DBMS_PARALLEL_EXECUTE-style extent chunking, else by `ORA_HASH(ROWID, n-1)`.
 - Partition descriptors are serialised bytes; `ReadPartition` on any connection executes its slice.
 - Option `oracle.partition_count`. Document consistency: slices are read at the same SCN using `AS OF SCN` captured at `ExecutePartitions` time.
