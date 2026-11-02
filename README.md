@@ -34,7 +34,7 @@ Tested against Oracle Autonomous DB (Ashburn), FIRES_WORLDWIDE table (333K rows,
 ## Installing
 
 ```bash
-go get github.com/chrisfw/adbc-driver-oracle@v0.3.0
+go get github.com/chrisfw/adbc-driver-oracle@v0.3.1
 ```
 
 Then add one `replace` to your `go.mod`:
@@ -81,6 +81,20 @@ db, err := drv.NewDatabase(map[string]string{
 ```
 
 The package builds with `CGO_ENABLED=0`.
+
+### What a consumer inherits
+
+Verified by building a fresh module against `v0.3.1`:
+
+| | |
+| --- | --- |
+| Go | **1.26 or newer.** `go get` raises the consumer's own `go` directive to 1.26.0, so an older toolchain fails. |
+| arrow-go | raised to **v18.8.0**, needed for the `timestamp_with_offset` extension. A consumer pinning an older v18 will be upgraded. |
+| cgo | not required |
+| binary size | about **95 MB** for a trivial consumer. Roughly 29 MB of that is the embedded SQL parser, which `go:embed` includes whether or not a consumer ever partitions a read. |
+
+`go mod tidy` is required after adding the `replace`, because the replace
+changes which go-ora version the build resolves.
 
 ## Usage
 
