@@ -81,6 +81,10 @@ type connectionImpl struct {
 	// a statement may override.
 	partitionCount int
 
+	// poolSize is how many connections this database may hold open, which
+	// bounds how many partitions can be read at once on it.
+	poolSize int
+
 	// numberScanRows samples rows to infer a type for unconstrained NUMBER;
 	// 0 disables it. See OptionNumberScanRows.
 	numberScanRows int

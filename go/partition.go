@@ -17,6 +17,7 @@ package oracle
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -124,254 +125,27 @@ func decodePartitionDescriptor(b []byte) (*partitionDescriptor, error) {
 // So only the shape below is accepted, and anything else is reported as not
 // implemented with the reason. The accepted shape is a single table, no join,
 // no set operator, no subquery, and an optional WHERE.
-// A query is split by running it several times with different predicates. So
-// anything whose answer depends on seeing all the rows at once is unsafe: it
-// would be computed per slice and the union would be wrong, not merely
-// unordered. The list below is what that rules out.
-//
-// Being wrong here is expensive and being conservative is nearly free, since
-// the fallback is a single partition that is always correct. So the rule is to
-// decline anything not clearly safe.
-var (
-	// Constructs that make the whole query unsplittable.
-	//
-	//   JOIN and the set operators: more than one table.
-	//   GROUP BY, HAVING: aggregation across rows.
-	//   CONNECT BY, START WITH, MODEL, PIVOT, UNPIVOT: row generation.
-	//   ORDER BY: splitting cannot preserve an order across slices.
-	//   FETCH, OFFSET, ROWNUM: each slice would apply its own row limit, so
-	//     "first 10 rows" would return up to 10 per slice.
-	//   FOR UPDATE: locking per slice is not the same lock.
-	//   DISTINCT, UNIQUE: duplicates are only removed within a slice.
-	//   OVER: an analytic window would be computed per slice, so a
-	//     ROW_NUMBER would restart in each one.
-	unsplittableClause = regexp.MustCompile(`(?is)\b(JOIN|UNION|MINUS|INTERSECT|GROUP\s+BY|HAVING|` +
-		`CONNECT\s+BY|START\s+WITH|MODEL|PIVOT|UNPIVOT|ORDER\s+BY|FETCH|OFFSET|ROWNUM|` +
-		`FOR\s+UPDATE|DISTINCT|UNIQUE|OVER)\b`)
-
-	// Aggregates with no GROUP BY return one row per slice instead of one row
-	// overall, which no amount of predicate rewriting fixes.
-	aggregateCall = regexp.MustCompile(`(?is)\b(COUNT|SUM|AVG|MIN|MAX|STDDEV|STDDEV_POP|STDDEV_SAMP|` +
-		`VARIANCE|VAR_POP|VAR_SAMP|LISTAGG|MEDIAN|CORR|COVAR_POP|COVAR_SAMP|` +
-		`COLLECT|XMLAGG|JSON_ARRAYAGG|JSON_OBJECTAGG|APPROX_COUNT_DISTINCT)\s*\(`)
-
-	// An identifier or a schema-qualified one, with optional double quotes.
-	tableName = regexp.MustCompile(`^"?[A-Za-z0-9_$#]+"?(?:\s*\.\s*"?[A-Za-z0-9_$#]+"?)?$`)
-	aliasName = regexp.MustCompile(`^"?[A-Za-z][A-Za-z0-9_$#]*"?$`)
-)
-
-// parsedQuery is the part of a query the rewriter needs.
-type parsedQuery struct {
-	columns string
-	table   string
-	where   string
-}
-
-// findKeyword returns the index of a top-level keyword occurrence: outside any
-// parentheses and outside any string or quoted identifier. A regexp cannot do
-// this, because it cannot count parentheses, and getting it wrong means
-// treating a subquery's FROM as the outer one.
-func findKeyword(q, keyword string) int {
-	depth := 0
-	for i := 0; i < len(q); i++ {
-		switch c := q[i]; c {
-		case '\'', '"':
-			// Skip the literal or quoted identifier whole. An unterminated one
-			// means the caller gets no match, which lands on single-partition.
-			j := i + 1
-			for j < len(q) && q[j] != c {
-				j++
-			}
-			if j >= len(q) {
-				return -1
-			}
-			i = j
-		case '(':
-			depth++
-		case ')':
-			depth--
-		default:
-			if depth != 0 || !isWordBoundaryAt(q, i, keyword) {
-				continue
-			}
-			return i
-		}
-	}
-	return -1
-}
-
-// isWordBoundaryAt reports whether keyword appears at i as a whole word,
-// compared without case.
-func isWordBoundaryAt(q string, i int, keyword string) bool {
-	if i+len(keyword) > len(q) {
-		return false
-	}
-	if !strings.EqualFold(q[i:i+len(keyword)], keyword) {
-		return false
-	}
-	if i > 0 && isIdentChar(q[i-1]) {
-		return false
-	}
-	if end := i + len(keyword); end < len(q) && isIdentChar(q[end]) {
-		return false
-	}
-	return true
-}
-
-func isIdentChar(c byte) bool {
-	return c == '_' || c == '$' || c == '#' ||
-		(c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-}
-
-// maskLiterals blanks the contents of string literals so a clause check does
-// not see keywords that are data. A column compared against the text
-// 'ORDER BY' is a perfectly splittable query, and reading that as a clause
-// would decline it for no reason.
-//
-// Lengths are preserved so reported offsets still line up with the original.
-func maskLiterals(q string) string {
-	out := []byte(q)
-	for i := 0; i < len(out); i++ {
-		if out[i] != '\'' {
-			continue
-		}
-		j := i + 1
-		for j < len(out) && out[j] != '\'' {
-			out[j] = ' '
-			j++
-		}
-		i = j
-	}
-	return string(out)
-}
-
-// parseSingleTableQuery recognises the one query shape that can be split, and
-// declines everything else with the reason.
-func parseSingleTableQuery(query string) (parsedQuery, error) {
-	q := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(query), ";"))
-	masked := maskLiterals(q)
-
-	// Comments can hide any of the constructs below, and stripping them
-	// correctly is more parser than this needs.
-	if strings.Contains(q, "--") || strings.Contains(q, "/*") {
-		return parsedQuery{}, fmt.Errorf("the query contains a comment, which this rewriter does not parse")
-	}
-	if strings.Count(q, "(") != strings.Count(q, ")") {
-		return parsedQuery{}, fmt.Errorf("the query has unbalanced parentheses")
-	}
-	if m := unsplittableClause.FindString(masked); m != "" {
-		return parsedQuery{}, fmt.Errorf(
-			"the query uses %s, whose result depends on seeing all rows at once, so splitting it would change the answer",
-			strings.ToUpper(strings.Join(strings.Fields(m), " ")))
-	}
-	if m := aggregateCall.FindString(masked); m != "" {
-		return parsedQuery{}, fmt.Errorf(
-			"the query aggregates with %s, so each slice would return its own result rather than part of one",
-			strings.ToUpper(strings.TrimRight(strings.TrimSpace(m), "( ")))
-	}
-
-	if !isWordBoundaryAt(masked, 0, "SELECT") {
-		return parsedQuery{}, fmt.Errorf("only a SELECT can be split")
-	}
-
-	// A second SELECT is a subquery, and a subquery is where consistency
-	// quietly breaks. AS OF SCN attaches to the one table named in the FROM
-	// clause, so a subquery's own table would be read at whatever SCN each
-	// slice happened to execute at: the slices would no longer share a
-	// snapshot, and the union could contain rows filtered against different
-	// states of the inner table.
-	if strings.Count(strings.ToUpper(masked), "SELECT") > 1 {
-		return parsedQuery{}, fmt.Errorf(
-			"the query contains a subquery, whose table would not be pinned to the partition snapshot " +
-				"because AS OF SCN applies only to the table in the FROM clause")
-	}
-
-	from := findKeyword(masked, "FROM")
-	if from < 0 {
-		return parsedQuery{}, fmt.Errorf("the query has no top-level FROM clause")
-	}
-	columns := strings.TrimSpace(q[len("SELECT"):from])
-	if columns == "" {
-		return parsedQuery{}, fmt.Errorf("the query selects no columns")
-	}
-
-	rest := q[from+len("FROM"):]
-	maskedRest := masked[from+len("FROM"):]
-	where := ""
-	if w := findKeyword(maskedRest, "WHERE"); w >= 0 {
-		where = strings.TrimSpace(rest[w+len("WHERE"):])
-		rest = rest[:w]
-		if where == "" {
-			return parsedQuery{}, fmt.Errorf("the query has an empty WHERE clause")
-		}
-	}
-
-	// What is left is the table and at most an alias. More than that is a
-	// clause this rewriter did not account for.
-	fields := strings.Fields(strings.TrimSpace(rest))
-	switch len(fields) {
-	case 0:
-		return parsedQuery{}, fmt.Errorf("the query names no table")
-	case 1:
-	case 2:
-		if !aliasName.MatchString(fields[1]) {
-			return parsedQuery{}, fmt.Errorf("%q after the table name is not an alias this rewriter recognises", fields[1])
-		}
-	default:
-		return parsedQuery{}, fmt.Errorf("the FROM clause has more in it than one table and an alias")
-	}
-
-	table := fields[0]
-	if !tableName.MatchString(table) {
-		return parsedQuery{}, fmt.Errorf("%q is not a plain table name, so it cannot be split by partition or ROWID", table)
-	}
-	return parsedQuery{columns: columns, table: table, where: where}, nil
-}
-
-// sliceQuery renders the SQL for one slice: the original columns and WHERE,
-// against the table as of the snapshot, narrowed by the strategy's predicate.
-//
-// The PARTITION clause has to precede AS OF SCN. The reverse order is a syntax
-// error, which is the kind of thing worth writing down next to the code that
-// depends on it.
-func (p parsedQuery) sliceQuery(scn, partitionName, predicate string) string {
-	var b strings.Builder
-	b.WriteString("SELECT ")
-	b.WriteString(p.columns)
-	b.WriteString(" FROM ")
-	b.WriteString(p.table)
-	if partitionName != "" {
-		b.WriteString(" PARTITION (")
-		b.WriteString(partitionName)
-		b.WriteString(")")
-	}
-	if scn != "" {
-		b.WriteString(" AS OF SCN ")
-		b.WriteString(scn)
-	}
-
-	switch {
-	case p.where != "" && predicate != "":
-		b.WriteString(" WHERE (")
-		b.WriteString(p.where)
-		b.WriteString(") AND (")
-		b.WriteString(predicate)
-		b.WriteString(")")
-	case p.where != "":
-		b.WriteString(" WHERE ")
-		b.WriteString(p.where)
-	case predicate != "":
-		b.WriteString(" WHERE ")
-		b.WriteString(predicate)
-	}
-	return b.String()
-}
+// Recognising which queries can be split, and rewriting them into slices,
+// both live in sqlclassify.go. They work on the parsed query rather than its
+// text: see the comment there for why that distinction decides correctness
+// rather than tidiness.
 
 // describeQuery wraps a query so it returns its own column metadata and no
 // rows, which is how the partitioned schema is obtained without reading
 // anything.
 func describeQuery(query string) string {
-	return "SELECT * FROM (" + strings.TrimSuffix(strings.TrimSpace(query), ";") + ") WHERE 1 = 0"
+	return "SELECT * FROM (" + wrappable(query) + ") WHERE 1 = 0"
+}
+
+// wrappable prepares a query to be surrounded by parentheses.
+//
+// The newline is load bearing. A query ending in a line comment swallows
+// whatever follows it on the same line, so `SELECT a FROM t -- nightly` becomes
+// `SELECT * FROM (SELECT a FROM t -- nightly) WHERE 1 = 0` and Oracle reports
+// a missing right parenthesis, because the parenthesis is inside the comment.
+// Ending the line first puts the parenthesis back in the statement.
+func wrappable(query string) string {
+	return strings.TrimSuffix(strings.TrimSpace(query), ";") + "\n"
 }
 
 // --- Planning ---
@@ -613,11 +387,11 @@ func coalesceRanges(ranges [][2]string, want int) [][][2]string {
 // MIN and MAX of the text form over a 500,000 row table bracket about 15% of
 // it. CHARTOROWID restores the exact value, so a chunk endpoint round-trips
 // losslessly.
-func rowidPredicate(ranges [][2]string) string {
+func rowidPredicate(rowid string, ranges [][2]string) string {
 	parts := make([]string, 0, len(ranges))
 	for _, r := range ranges {
 		parts = append(parts,
-			"ROWID BETWEEN CHARTOROWID('"+r[0]+"') AND CHARTOROWID('"+r[1]+"')")
+			rowid+" BETWEEN CHARTOROWID('"+r[0]+"') AND CHARTOROWID('"+r[1]+"')")
 	}
 	if len(parts) == 1 {
 		return parts[0]
@@ -649,12 +423,8 @@ func (c *connectionImpl) objectIsTable(ctx context.Context, owner, name string) 
 // planPartitions walks the strategy ladder and returns one slice query per
 // partition, plus the strategy that produced them and the reason any better
 // strategy was skipped.
-func (c *connectionImpl) planPartitions(ctx context.Context, pq parsedQuery, scn string, want int) (queries []string, strategy partitionStrategy, reason string) {
-	owner, table := splitQualifiedName(pq.table)
-	owner = strings.ToUpper(strings.Trim(owner, `"`))
-	table = strings.ToUpper(strings.Trim(table, `"`))
-
-	isTable, err := c.objectIsTable(ctx, owner, table)
+func (c *connectionImpl) planPartitions(ctx context.Context, q *splittableQuery, scn string, want int) (queries []string, strategy partitionStrategy, reason string) {
+	isTable, err := c.objectIsTable(ctx, q.owner, q.table)
 	if err != nil || !isTable {
 		why := "it is not a table in this schema, so it has no partitions or ROWID ranges to split"
 		if err != nil {
@@ -663,11 +433,28 @@ func (c *connectionImpl) planPartitions(ctx context.Context, pq parsedQuery, scn
 		return nil, partitionSingle, why
 	}
 
+	// render builds one slice and reports a failure as a reason to fall back,
+	// since a slice that cannot be built is not a slice that should be run.
+	var failed error
+	render := func(spec sliceSpec) string {
+		if failed != nil {
+			return ""
+		}
+		sql, err := buildSlice(ctx, q, spec)
+		if err != nil {
+			failed = err
+		}
+		return sql
+	}
+
 	// Best: one slice per partition. Disjoint segments, so the scan is divided
 	// rather than repeated.
-	if parts, err := c.tablePartitions(ctx, owner, table); err == nil && len(parts) > 1 {
+	if parts, err := c.tablePartitions(ctx, q.owner, q.table); err == nil && len(parts) > 1 {
 		for _, name := range parts {
-			queries = append(queries, pq.sliceQuery(scn, quoteOracleIdentifier(name), ""))
+			queries = append(queries, render(sliceSpec{scn: scn, partition: name}))
+		}
+		if failed != nil {
+			return nil, partitionSingle, "the partition slices could not be built: " + failed.Error()
 		}
 		// The partition count is what the table has, not what was asked for:
 		// a PARTITION clause names one partition, and covering several in one
@@ -676,10 +463,14 @@ func (c *connectionImpl) planPartitions(ctx context.Context, pq parsedQuery, scn
 	}
 
 	// Next: disjoint ROWID ranges over the heap.
-	ranges, rangeErr := c.rowidRanges(ctx, owner, table, want)
+	rowid := q.qualifiedRowid()
+	ranges, rangeErr := c.rowidRanges(ctx, q.owner, q.table, want)
 	if rangeErr == nil && len(ranges) > 0 {
 		for _, group := range coalesceRanges(ranges, want) {
-			queries = append(queries, pq.sliceQuery(scn, "", rowidPredicate(group)))
+			queries = append(queries, render(sliceSpec{scn: scn, predicate: rowidPredicate(rowid, group)}))
+		}
+		if failed != nil {
+			return nil, partitionSingle, "the ROWID range slices could not be built: " + failed.Error()
 		}
 		return queries, partitionByRowidRange, ""
 	}
@@ -690,8 +481,11 @@ func (c *connectionImpl) planPartitions(ctx context.Context, pq parsedQuery, scn
 	// unavailable travels with the result so this is a visible tradeoff rather
 	// than a silent one.
 	for k := 0; k < want; k++ {
-		pred := "ORA_HASH(ROWID, " + itoa(want-1) + ") = " + itoa(k)
-		queries = append(queries, pq.sliceQuery(scn, "", pred))
+		pred := "ORA_HASH(" + rowid + ", " + itoa(want-1) + ") = " + itoa(k)
+		queries = append(queries, render(sliceSpec{scn: scn, predicate: pred}))
+	}
+	if failed != nil {
+		return nil, partitionSingle, "the hash slices could not be built: " + failed.Error()
 	}
 	reason = "ROWID range chunking was unavailable, so each slice filters a full scan by ORA_HASH(ROWID): " +
 		"total server I/O is multiplied by the partition count"
@@ -720,10 +514,10 @@ func (s *statementImpl) partitionSchema(ctx context.Context, query, scn string) 
 	if scn != "" {
 		// Sample at the same snapshot the slices read, so the types describe
 		// the data being returned rather than the data as it is now.
-		probe = "SELECT * FROM (" + query + ") AS OF SCN " + scn
+		probe = "SELECT * FROM (" + wrappable(query) + ") AS OF SCN " + scn
 	}
 	if n := pol.numberScanRows; n > 0 {
-		probe = "SELECT * FROM (" + probe + ") WHERE ROWNUM <= " + itoa(n)
+		probe = "SELECT * FROM (" + wrappable(probe) + ") WHERE ROWNUM <= " + itoa(n)
 	} else {
 		probe = describeQuery(probe)
 	}
@@ -773,6 +567,23 @@ func (s *statementImpl) ExecutePartitions(ctx context.Context) (*arrow.Schema, a
 		return s.singlePartition(ctx, "oracle.partition_count is 1")
 	}
 
+	// Reading the slices is the caller's job, and the usual way is one
+	// connection per slice on this same database. That needs a pool big
+	// enough to hold them: with more slices than connections, opening the
+	// last one blocks until an earlier reader finishes, which turns a
+	// parallel read into a serial one or a deadlock if the caller waits for
+	// all of them before closing any.
+	//
+	// The driver cannot tell how the partitions will be read, since ADBC
+	// allows them to go to other processes entirely, so this is a warning
+	// rather than a cap.
+	if pool := s.cnxn.poolSize; pool > 0 && want > pool && s.cnxn.Logger != nil {
+		s.cnxn.Logger.Warn(
+			"more partitions were requested than the connection pool can hold, "+
+				"so reading them all at once on this database will block",
+			"partitions", want, OptionPoolSize, pool)
+	}
+
 	// Every slice reads at this SCN, which is what makes the union a
 	// consistent snapshot instead of several reads drifting against
 	// concurrent writes. Without it, splitting would change the answer.
@@ -782,9 +593,15 @@ func (s *statementImpl) ExecutePartitions(ctx context.Context) (*arrow.Schema, a
 			"the current SCN could not be read, so the slices could not be pinned to one snapshot: "+err.Error())
 	}
 
-	pq, err := parseSingleTableQuery(s.query)
+	q, err := classifyQuery(ctx, s.query)
 	if err != nil {
-		return s.singlePartition(ctx, err.Error())
+		var refusal splitRefusal
+		if errors.As(err, &refusal) {
+			return s.singlePartition(ctx, refusal.reason)
+		}
+		// The parser itself is unavailable, which is not a property of the
+		// query, so say so rather than reporting the query as unsplittable.
+		return s.singlePartition(ctx, "the SQL parser is unavailable: "+err.Error())
 	}
 
 	// Describe the query at the captured SCN before planning anything. This
@@ -803,7 +620,7 @@ func (s *statementImpl) ExecutePartitions(ctx context.Context) (*arrow.Schema, a
 	}
 	pinned := encodeNumberTypes(inferred)
 
-	queries, strategy, reason := s.cnxn.planPartitions(ctx, pq, scn, want)
+	queries, strategy, reason := s.cnxn.planPartitions(ctx, q, scn, want)
 	if len(queries) == 0 {
 		return s.singlePartition(ctx, reason)
 	}

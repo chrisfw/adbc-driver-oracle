@@ -305,6 +305,15 @@ func (db *databaseImpl) effectiveNumberScanRows() int {
 	return db.numberScanRows
 }
 
+// effectivePoolSize resolves the unset value to the default, matching what
+// getPool actually configures.
+func (db *databaseImpl) effectivePoolSize() int {
+	if db.poolSize <= 0 {
+		return 8
+	}
+	return db.poolSize
+}
+
 // effectivePartitionCount resolves the unset value to the default.
 func (db *databaseImpl) effectivePartitionCount() int {
 	if db.partitionCount < 1 {
@@ -481,6 +490,7 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 
 		numberScanRows:      db.effectiveNumberScanRows(),
 		partitionCount:      db.effectivePartitionCount(),
+		poolSize:            db.effectivePoolSize(),
 		numberOverflow:      db.effectiveNumberOverflow(),
 		compactDecimals:     db.compactDecimals,
 		timestampWithOffset: db.timestampWithOffset,

@@ -15,6 +15,7 @@
 package oracle
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,27 +26,41 @@ import (
 )
 
 // A rewrite that misreads a query returns wrong data rather than failing, so
-// the parser has to decline everything it cannot account for. These cases are
-// the boundary: what is safe to split, and what must not be.
-func TestParseSingleTableQuery(t *testing.T) {
+// the classifier has to decline everything it cannot account for. These cases
+// are the boundary: what is safe to split, and what must not be.
+//
+// These run the embedded SQL parser, so the first of them pays the one time
+// cost of compiling the WebAssembly module (several seconds). No database is
+// involved.
+func TestClassifyQuery(t *testing.T) {
+	ctx := context.Background()
+
 	cases := []struct {
 		name    string
 		query   string
 		wantErr bool
+		owner   string
 		table   string
-		where   string
-		columns string
+		alias   string
 	}{
-		{name: "star", query: "SELECT * FROM T1", table: "T1", columns: "*"},
-		{name: "column list", query: "SELECT A, B FROM T1", table: "T1", columns: "A, B"},
-		{name: "with where", query: "SELECT A FROM T1 WHERE A > 5", table: "T1", columns: "A", where: "A > 5"},
-		{name: "qualified", query: "SELECT * FROM OWNER.T1", table: "OWNER.T1", columns: "*"},
-		{name: "quoted", query: `SELECT * FROM "MixedCase"`, table: `"MixedCase"`, columns: "*"},
-		{name: "lowercase keywords", query: "select a from t1 where a = 1", table: "t1", columns: "a", where: "a = 1"},
-		{name: "trailing semicolon", query: "SELECT * FROM T1;", table: "T1", columns: "*"},
-		{name: "alias", query: "SELECT t.A FROM T1 t WHERE t.A > 1", table: "T1", columns: "t.A", where: "t.A > 1"},
-		{name: "newlines", query: "SELECT A,\n  B\nFROM T1\nWHERE A IS NOT NULL",
-			table: "T1", columns: "A,\n  B", where: "A IS NOT NULL"},
+		{name: "star", query: "SELECT * FROM T1", table: "T1"},
+		{name: "column list", query: "SELECT A, B FROM T1", table: "T1"},
+		{name: "with where", query: "SELECT A FROM T1 WHERE A > 5", table: "T1"},
+		{name: "qualified", query: "SELECT * FROM OWNER.T1", owner: "OWNER", table: "T1"},
+		{name: "lowercase keywords", query: "select a from t1 where a = 1", table: "T1"},
+		{name: "trailing semicolon", query: "SELECT * FROM T1;", table: "T1"},
+		{name: "alias", query: "SELECT t.A FROM T1 t WHERE t.A > 1", table: "T1", alias: "t"},
+		{name: "newlines", query: "SELECT A,\n  B\nFROM T1\nWHERE A IS NOT NULL", table: "T1"},
+		{name: "expression columns", query: "SELECT A + 1, UPPER(B) FROM T1", table: "T1"},
+		{name: "case expression", query: "SELECT CASE WHEN A > 1 THEN 1 ELSE 0 END FROM T1", table: "T1"},
+
+		// Parsing rather than text matching is what makes these splittable.
+		// The scanner this replaced rejected every one of them.
+		{name: "optimizer hint", query: "SELECT /*+ PARALLEL(4) */ A FROM T1", table: "T1"},
+		{name: "line comment", query: "SELECT A FROM T1 -- extract for the warehouse", table: "T1"},
+		{name: "block comment", query: "SELECT A /* the key */ FROM T1", table: "T1"},
+		{name: "keyword in a literal", query: "SELECT A FROM T1 WHERE B = 'ORDER BY DISTINCT'", table: "T1"},
+		{name: "column named like a clause", query: "SELECT ORDER_TOTAL FROM T1 WHERE GROUPING_LEVEL = 1", table: "T1"},
 
 		// Everything below would be split wrongly, so it must be refused.
 		{name: "join", query: "SELECT * FROM T1 JOIN T2 ON T1.A = T2.A", wantErr: true},
@@ -56,9 +71,8 @@ func TestParseSingleTableQuery(t *testing.T) {
 		{name: "group by", query: "SELECT A, COUNT(*) FROM T1 GROUP BY A", wantErr: true},
 		{name: "having", query: "SELECT A FROM T1 GROUP BY A HAVING COUNT(*) > 1", wantErr: true},
 		{name: "connect by", query: "SELECT A FROM T1 CONNECT BY PRIOR A = B", wantErr: true},
-		{name: "subquery in from", query: "SELECT * FROM (SELECT A FROM T1)", wantErr: true},
+		{name: "subquery in from", query: "SELECT * FROM (SELECT A FROM T1) X", wantErr: true},
 		{name: "not a select", query: "UPDATE T1 SET A = 1", wantErr: true},
-		{name: "unbalanced parens", query: "SELECT * FROM T1 WHERE A IN (1, 2", wantErr: true},
 		{name: "empty", query: "", wantErr: true},
 
 		// These return a different answer when run several times rather than
@@ -69,117 +83,197 @@ func TestParseSingleTableQuery(t *testing.T) {
 		{name: "rownum limit", query: "SELECT A FROM T1 WHERE ROWNUM <= 10", wantErr: true},
 		{name: "fetch first", query: "SELECT A FROM T1 FETCH FIRST 10 ROWS ONLY", wantErr: true},
 		{name: "offset", query: "SELECT A FROM T1 OFFSET 5 ROWS", wantErr: true},
-		{name: "bare aggregate", query: "SELECT COUNT(*) FROM T1", wantErr: true},
-		{name: "sum", query: "SELECT SUM(A) FROM T1", wantErr: true},
+		{name: "bare count", query: "SELECT COUNT(*) FROM T1", wantErr: true},
+		{name: "bare sum", query: "SELECT SUM(A) FROM T1", wantErr: true},
+		{name: "bare max", query: "SELECT MAX(A) FROM T1", wantErr: true},
+		{name: "listagg", query: "SELECT LISTAGG(A, ',') FROM T1", wantErr: true},
+		{name: "aggregate in where", query: "SELECT A FROM T1 WHERE A > ALL (SELECT MAX(B) FROM T2)", wantErr: true},
 		{name: "analytic window", query: "SELECT ROW_NUMBER() OVER (ORDER BY A) FROM T1", wantErr: true},
+		{name: "analytic sum", query: "SELECT SUM(A) OVER () FROM T1", wantErr: true},
 		{name: "for update", query: "SELECT A FROM T1 FOR UPDATE", wantErr: true},
+		{name: "sample", query: "SELECT A FROM T1 SAMPLE (10)", wantErr: true},
 
-		// A comment can hide any of the above, and this rewriter does not
-		// parse comments.
-		{name: "line comment", query: "SELECT A FROM T1 -- ORDER BY A", wantErr: true},
-		{name: "block comment", query: "SELECT A /* DISTINCT */ FROM T1", wantErr: true},
-
-		// A subquery is valid to rewrite but not safe to split: AS OF SCN
-		// pins only the table in the FROM clause, so the inner table would be
-		// read at a different moment by each slice.
+		// A subquery is valid to rewrite but not safe to split: a flashback
+		// clause pins only the table in the FROM clause, so the inner table
+		// would be read at a different moment by each slice.
 		{name: "subquery in where", query: "SELECT A FROM T1 WHERE A IN (SELECT B FROM T2)", wantErr: true},
-		{name: "scalar subquery in select list", query: "SELECT A, (SELECT B FROM T2) FROM T1", wantErr: true},
-		{name: "extra clause", query: "SELECT A FROM T1 SAMPLE (10)", wantErr: true},
+		{name: "scalar subquery", query: "SELECT A, (SELECT MIN(B) FROM T2) FROM T1", wantErr: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseSingleTableQuery(tc.query)
+			got, err := classifyQuery(ctx, tc.query)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("parseSingleTableQuery(%q) accepted a query it cannot split safely, giving table %q where %q",
-						tc.query, got.table, got.where)
+					t.Fatalf("classifyQuery(%q) accepted a query it cannot split safely, giving table %s.%s",
+						tc.query, got.owner, got.table)
+				}
+				// A refusal has to be distinguishable from the parser being
+				// broken, because the two call for different handling.
+				var refusal splitRefusal
+				if !errors.As(err, &refusal) {
+					t.Fatalf("classifyQuery(%q) failed rather than refusing: %v", tc.query, err)
+				}
+				if refusal.reason == "" {
+					t.Error("the refusal carries no reason")
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("parseSingleTableQuery(%q): %v", tc.query, err)
+				t.Fatalf("classifyQuery(%q): %v", tc.query, err)
 			}
 			if got.table != tc.table {
 				t.Errorf("table = %q, want %q", got.table, tc.table)
 			}
-			if got.where != tc.where {
-				t.Errorf("where = %q, want %q", got.where, tc.where)
+			if got.owner != tc.owner {
+				t.Errorf("owner = %q, want %q", got.owner, tc.owner)
 			}
-			if got.columns != tc.columns {
-				t.Errorf("columns = %q, want %q", got.columns, tc.columns)
+			if got.alias != tc.alias {
+				t.Errorf("alias = %q, want %q", got.alias, tc.alias)
 			}
 		})
 	}
 }
 
-// A keyword inside a string literal is data, not syntax. Mistaking one for a
-// clause boundary would slice the query at the wrong place.
-func TestParseIgnoresKeywordsInsideLiterals(t *testing.T) {
-	got, err := parseSingleTableQuery("SELECT A FROM T1 WHERE B = 'FROM WHERE ORDER BY'")
+// A predicate must never be lost and must never be widened: a slice missing
+// its WHERE returns rows the caller did not ask for, and one that loses the
+// caller's parentheses returns rows from outside its own slice.
+func TestBuildSliceKeepsThePredicate(t *testing.T) {
+	ctx := context.Background()
+	q, err := classifyQuery(ctx, "SELECT A FROM T1 WHERE A > 5 OR B IS NULL")
 	if err != nil {
-		t.Fatalf("a literal containing keywords was treated as syntax: %v", err)
+		t.Fatalf("classify: %v", err)
 	}
-	if got.table != "T1" {
-		t.Errorf("table = %q, want T1", got.table)
-	}
-	if want := "B = 'FROM WHERE ORDER BY'"; got.where != want {
-		t.Errorf("where = %q, want %q", got.where, want)
-	}
-}
 
-// A subquery whose WHERE mentions a column named like a keyword must not be
-// mistaken for a disqualifying construct, and a predicate must never be lost:
-// a slice missing its WHERE returns rows the caller did not ask for.
-func TestSliceQueryKeepsThePredicate(t *testing.T) {
-	pq, err := parseSingleTableQuery("SELECT A FROM T1 WHERE A > 5 OR B IS NULL")
+	got, err := buildSlice(ctx, q, sliceSpec{scn: "4242", predicate: "ORA_HASH(ROWID, 3) = 1"})
 	if err != nil {
-		t.Fatalf("parse: %v", err)
+		t.Fatalf("buildSlice: %v", err)
 	}
 
-	got := pq.sliceQuery("4242", "", "ORA_HASH(ROWID, 3) = 1")
-
-	// The original predicate is an OR, so appending AND without parenthesising
-	// it would widen the slice to every row where A > 5, regardless of hash.
-	// That is the bug this asserts against.
-	want := "SELECT A FROM T1 AS OF SCN 4242 WHERE (A > 5 OR B IS NULL) AND (ORA_HASH(ROWID, 3) = 1)"
+	// The original predicate is an OR, so ANDing without parenthesising it
+	// would widen the slice to every row where A > 5, regardless of hash.
+	// Generating from the AST is what makes the parentheses the generator's
+	// job rather than this driver's.
+	want := "SELECT A FROM T1 AS OF SCN 4242 WHERE (A > 5 OR B IS NULL) AND ORA_HASH(ROWID, 3) = 1"
 	if got != want {
-		t.Errorf("sliceQuery:\n got %s\nwant %s", got, want)
+		t.Errorf("buildSlice:\n got %s\nwant %s", got, want)
 	}
 }
 
-// PARTITION has to come before AS OF SCN. The other order is ORA-03048, so
-// this ordering is a syntax requirement rather than a style choice.
-func TestSliceQueryPartitionPrecedesFlashback(t *testing.T) {
-	pq := parsedQuery{columns: "*", table: "T1"}
-	got := pq.sliceQuery("99", "P1", "")
+// Oracle requires PARTITION before AS OF SCN and rejects the reverse with
+// ORA-03048, so the generated order is a correctness requirement.
+func TestBuildSlicePartitionPrecedesFlashback(t *testing.T) {
+	ctx := context.Background()
+	q, err := classifyQuery(ctx, "SELECT * FROM T1")
+	if err != nil {
+		t.Fatalf("classify: %v", err)
+	}
 
-	if want := "SELECT * FROM T1 PARTITION (P1) AS OF SCN 99"; got != want {
-		t.Fatalf("sliceQuery = %q, want %q", got, want)
+	got, err := buildSlice(ctx, q, sliceSpec{scn: "99", partition: "P1"})
+	if err != nil {
+		t.Fatalf("buildSlice: %v", err)
+	}
+	if want := "SELECT * FROM T1 PARTITION(P1) AS OF SCN 99"; got != want {
+		t.Fatalf("buildSlice = %q, want %q", got, want)
 	}
 	if strings.Index(got, "AS OF SCN") < strings.Index(got, "PARTITION") {
 		t.Error("AS OF SCN precedes PARTITION, which Oracle rejects with ORA-03048")
 	}
 }
 
-func TestSliceQueryCombinations(t *testing.T) {
-	pq := parsedQuery{columns: "A", table: "T1"}
-	withWhere := parsedQuery{columns: "A", table: "T1", where: "A > 1"}
+func TestBuildSliceCombinations(t *testing.T) {
+	ctx := context.Background()
 
 	cases := []struct {
-		name string
-		got  string
-		want string
+		name  string
+		query string
+		spec  sliceSpec
+		want  string
 	}{
-		{"no scn no predicate", pq.sliceQuery("", "", ""), "SELECT A FROM T1"},
-		{"predicate only", pq.sliceQuery("", "", "ROWID IS NOT NULL"), "SELECT A FROM T1 WHERE ROWID IS NOT NULL"},
-		{"where only", withWhere.sliceQuery("", "", ""), "SELECT A FROM T1 WHERE A > 1"},
-		{"scn only", pq.sliceQuery("7", "", ""), "SELECT A FROM T1 AS OF SCN 7"},
+		{"no scn no predicate", "SELECT A FROM T1", sliceSpec{}, "SELECT A FROM T1"},
+		{"predicate only", "SELECT A FROM T1", sliceSpec{predicate: "ROWID IS NOT NULL"},
+			"SELECT A FROM T1 WHERE ROWID IS NOT NULL"},
+		{"where only", "SELECT A FROM T1 WHERE A > 1", sliceSpec{}, "SELECT A FROM T1 WHERE A > 1"},
+		{"scn only", "SELECT A FROM T1", sliceSpec{scn: "7"}, "SELECT A FROM T1 AS OF SCN 7"},
+		{"where and predicate", "SELECT A FROM T1 WHERE A > 1", sliceSpec{predicate: "B = 2"},
+			"SELECT A FROM T1 WHERE A > 1 AND B = 2"},
+		// A hint has to survive the rewrite, since the caller put it there to
+		// control the plan the slice runs with.
+		{"hint survives", "SELECT /*+ FULL(T1) */ A FROM T1", sliceSpec{scn: "5"},
+			"SELECT /*+ FULL(T1) */ A FROM T1 AS OF SCN 5"},
 	}
 	for _, tc := range cases {
-		if tc.got != tc.want {
-			t.Errorf("%s:\n got %s\nwant %s", tc.name, tc.got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := classifyQuery(ctx, tc.query)
+			if err != nil {
+				t.Fatalf("classify: %v", err)
+			}
+			got, err := buildSlice(ctx, q, tc.spec)
+			if err != nil {
+				t.Fatalf("buildSlice: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("\n got %s\nwant %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// Once a table is aliased, Oracle rejects a bare reference to it, so a ROWID
+// predicate has to be qualified with the alias.
+func TestBuildSliceQualifiesRowidWithTheAlias(t *testing.T) {
+	ctx := context.Background()
+
+	aliased, err := classifyQuery(ctx, "SELECT x.A FROM T1 x WHERE x.A > 1")
+	if err != nil {
+		t.Fatalf("classify aliased: %v", err)
+	}
+	if got := aliased.qualifiedRowid(); got != `"x".ROWID` {
+		t.Errorf("aliased ROWID = %q, want %q", got, `"x".ROWID`)
+	}
+
+	bare, err := classifyQuery(ctx, "SELECT A FROM T1")
+	if err != nil {
+		t.Fatalf("classify bare: %v", err)
+	}
+	if got := bare.qualifiedRowid(); got != "ROWID" {
+		t.Errorf("unaliased ROWID = %q, want ROWID", got)
+	}
+
+	// And the qualified form has to survive into the generated slice.
+	got, err := buildSlice(ctx, aliased, sliceSpec{
+		predicate: rowidPredicate(aliased.qualifiedRowid(), [][2]string{{"AAA", "BBB"}}),
+	})
+	if err != nil {
+		t.Fatalf("buildSlice: %v", err)
+	}
+	if !strings.Contains(got, `"x".ROWID BETWEEN`) {
+		t.Errorf("the alias was lost from the ROWID predicate: %s", got)
+	}
+}
+
+// A query that already pins itself to a snapshot keeps its own clause: the
+// caller chose that SCN and the slices should share it rather than be moved to
+// a different one.
+func TestBuildSliceRespectsAnExistingFlashback(t *testing.T) {
+	ctx := context.Background()
+	q, err := classifyQuery(ctx, "SELECT A FROM T1 AS OF SCN 1000")
+	if err != nil {
+		t.Fatalf("classify: %v", err)
+	}
+	if !q.pinnedAlready {
+		t.Fatal("a query with AS OF SCN was not recognised as already pinned")
+	}
+
+	got, err := buildSlice(ctx, q, sliceSpec{scn: "9999", predicate: "ORA_HASH(ROWID, 1) = 0"})
+	if err != nil {
+		t.Fatalf("buildSlice: %v", err)
+	}
+	if !strings.Contains(got, "AS OF SCN 1000") {
+		t.Errorf("the caller's SCN was replaced: %s", got)
+	}
+	if strings.Contains(got, "9999") {
+		t.Errorf("the driver's SCN overrode the caller's: %s", got)
 	}
 }
 
@@ -256,7 +350,7 @@ func TestCoalesceRangesBalances(t *testing.T) {
 // table and silently loses the rest, so the endpoints must go through
 // CHARTOROWID.
 func TestRowidPredicateConvertsEndpoints(t *testing.T) {
-	one := rowidPredicate([][2]string{{"AAASuGAAMAAAACFAAA", "AAASuGAAMAAABEHCcf"}})
+	one := rowidPredicate("ROWID", [][2]string{{"AAASuGAAMAAAACFAAA", "AAASuGAAMAAABEHCcf"}})
 	if want := "ROWID BETWEEN CHARTOROWID('AAASuGAAMAAAACFAAA') AND CHARTOROWID('AAASuGAAMAAABEHCcf')"; one != want {
 		t.Errorf("single range:\n got %s\nwant %s", one, want)
 	}
@@ -264,7 +358,7 @@ func TestRowidPredicateConvertsEndpoints(t *testing.T) {
 		t.Error("an endpoint is being compared as text, which drops rows")
 	}
 
-	two := rowidPredicate([][2]string{{"a", "b"}, {"c", "d"}})
+	two := rowidPredicate("ROWID", [][2]string{{"a", "b"}, {"c", "d"}})
 	want := "(ROWID BETWEEN CHARTOROWID('a') AND CHARTOROWID('b')) OR " +
 		"(ROWID BETWEEN CHARTOROWID('c') AND CHARTOROWID('d'))"
 	if two != want {
@@ -361,8 +455,26 @@ func TestDecodePartitionDescriptorValidates(t *testing.T) {
 
 func TestDescribeQueryReturnsNoRows(t *testing.T) {
 	got := describeQuery("SELECT A FROM T1 WHERE A > 1;")
-	if want := "SELECT * FROM (SELECT A FROM T1 WHERE A > 1) WHERE 1 = 0"; got != want {
-		t.Errorf("describeQuery:\n got %s\nwant %s", got, want)
+	if want := "SELECT * FROM (SELECT A FROM T1 WHERE A > 1\n) WHERE 1 = 0"; got != want {
+		t.Errorf("describeQuery:\n got %q\nwant %q", got, want)
+	}
+}
+
+// A query ending in a line comment must still be wrappable: without a newline
+// the closing parenthesis lands inside the comment and Oracle reports
+// ORA-00907, missing right parenthesis.
+func TestDescribeQuerySurvivesALineComment(t *testing.T) {
+	got := describeQuery("SELECT A FROM T1 -- nightly extract")
+	if !strings.HasSuffix(got, ") WHERE 1 = 0") {
+		t.Fatalf("describeQuery produced %q", got)
+	}
+	comment := strings.Index(got, "--")
+	newline := strings.Index(got, "\n")
+	if newline < comment {
+		t.Errorf("the newline does not end the comment: %q", got)
+	}
+	if strings.Contains(got[comment:newline], ")") {
+		t.Errorf("the closing parenthesis is inside the comment: %q", got)
 	}
 }
 

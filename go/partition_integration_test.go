@@ -123,7 +123,7 @@ func partitionedRead(ctx context.Context, t *testing.T, db adbc.Database, cnxn a
 		}
 		descs = append(descs, d)
 
-		reader, schema2, got := readOnePartition(ctx, t, db, id)
+		schema2, got := readOnePartition(ctx, t, db, id)
 		// Each slice must announce the schema the planner promised. A slice
 		// that decided its own types would hand the caller columns that do
 		// not line up with the others.
@@ -132,25 +132,31 @@ func partitionedRead(ctx context.Context, t *testing.T, db adbc.Database, cnxn a
 				i, schema2, schema)
 		}
 		rows = append(rows, got...)
-		reader.Release()
 	}
 	return rows, schema, descs
 }
 
-// readOnePartition opens a connection of its own and reads the slice on it.
-func readOnePartition(ctx context.Context, t *testing.T, db adbc.Database, id []byte) (array.RecordReader, *arrow.Schema, []string) {
+// readOnePartition opens a connection of its own, reads the slice, and closes
+// the connection before returning.
+//
+// Closing immediately rather than at test cleanup is the point. The pool holds
+// oracle.pool_size connections (eight by default), so a test that reads
+// several partitioned queries while deferring every close runs the pool dry
+// and then blocks waiting for a connection that nothing will release.
+func readOnePartition(ctx context.Context, t *testing.T, db adbc.Database, id []byte) (*arrow.Schema, []string) {
 	t.Helper()
 	cnxn, err := db.Open(ctx)
 	if err != nil {
 		t.Fatalf("Open for partition read: %v", err)
 	}
-	t.Cleanup(func() { cnxn.Close() })
+	defer cnxn.Close()
 
 	reader, err := cnxn.ReadPartition(ctx, id)
 	if err != nil {
 		t.Fatalf("ReadPartition: %v", err)
 	}
-	return reader, reader.Schema(), rowsOf(t, reader)
+	defer reader.Release()
+	return reader.Schema(), rowsOf(t, reader)
 }
 
 func assertSameMultiset(t *testing.T, label string, got, want []string) {
@@ -343,7 +349,9 @@ func TestIntegration_PartitionsCoverPartitionedTable(t *testing.T) {
 		t.Errorf("produced %d slices for a 3 partition table", len(descs))
 	}
 	for i, d := range descs {
-		if !strings.Contains(strings.ToUpper(d.Query), "PARTITION (") {
+		// The generator emits PARTITION(P1) without a space, which Oracle
+		// accepts, so the assertion must not depend on the spacing.
+		if !strings.Contains(strings.ToUpper(d.Query), "PARTITION(") {
 			t.Errorf("partition %d does not name a partition: %s", i, d.Query)
 		}
 		// The order is a syntax requirement: the reverse is ORA-03048.
@@ -497,6 +505,56 @@ func TestIntegration_PartitionsPinInferredNumberTypes(t *testing.T) {
 	} else {
 		t.Logf("teeth confirmed: unpinned, the last slice would announce %s instead of %s",
 			reader.Schema().Field(1).Type, valType)
+	}
+}
+
+// Parsing the query rather than matching its text is what makes these
+// splittable. The scanner this replaced rejected every comment and every
+// optimizer hint outright, so a caller who wrote either silently lost all
+// parallelism.
+func TestIntegration_HintsAndCommentsStillSplit(t *testing.T) {
+	ctx, db, cnxn := openPartitionDatabase(t, nil)
+
+	const table = "P43_HINT"
+	dropTable(ctx, t, cnxn, table)
+	execUpdate(ctx, t, cnxn, `CREATE TABLE `+table+` (ID NUMBER(10), LABEL VARCHAR2(40), PAD VARCHAR2(200))`)
+	t.Cleanup(func() { dropTable(ctx, t, cnxn, table) })
+	execUpdate(ctx, t, cnxn, `INSERT INTO `+table+`
+		SELECT LEVEL, 'row-' || LEVEL, RPAD('h', 200, 'h') FROM DUAL CONNECT BY LEVEL <= 20000`)
+	waitForFlashback(ctx, t, cnxn, table)
+
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"optimizer hint", "SELECT /*+ FULL(" + table + ") */ ID, LABEL FROM " + table},
+		{"line comment", "SELECT ID, LABEL FROM " + table + " -- nightly extract"},
+		{"block comment", "SELECT ID, /* the label */ LABEL FROM " + table},
+		{"keyword in a literal", "SELECT ID, LABEL FROM " + table + " WHERE LABEL <> 'ORDER BY'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want, _ := readWholeQuery(ctx, t, cnxn, tc.query)
+			got, _, descs := partitionedRead(ctx, t, db, cnxn, tc.query, nil)
+
+			if len(descs) < 2 {
+				t.Errorf("%s produced %d partitions, so it was not split", tc.name, len(descs))
+			}
+			if descs[0].Strategy == partitionSingle {
+				t.Errorf("%s fell back to a single partition", tc.name)
+			}
+			assertSameMultiset(t, tc.name, got, want)
+		})
+	}
+
+	// The hint has to survive into the slice SQL, since the caller put it
+	// there to control the plan each slice runs with.
+	hinted := "SELECT /*+ FULL(" + table + ") */ ID FROM " + table
+	_, _, descs := partitionedRead(ctx, t, db, cnxn, hinted, nil)
+	for i, d := range descs {
+		if !strings.Contains(d.Query, "/*+") {
+			t.Errorf("partition %d dropped the optimizer hint: %s", i, d.Query)
+		}
 	}
 }
 
@@ -762,16 +820,21 @@ func TestIntegration_HashBucketsPartitionTheTable(t *testing.T) {
 	t.Cleanup(func() { dropTable(ctx, t, cnxn, table) })
 	execUpdate(ctx, t, cnxn, `INSERT INTO `+table+` SELECT LEVEL FROM DUAL CONNECT BY LEVEL <= 2000`)
 
-	pq, err := parseSingleTableQuery("SELECT ID FROM " + table)
+	pq, err := classifyQuery(ctx, "SELECT ID FROM "+table)
 	if err != nil {
-		t.Fatalf("parse: %v", err)
+		t.Fatalf("classify: %v", err)
 	}
 
 	const buckets = 4
 	total := 0
 	nonEmpty := 0
 	for k := 0; k < buckets; k++ {
-		q := pq.sliceQuery("", "", fmt.Sprintf("ORA_HASH(ROWID, %d) = %d", buckets-1, k))
+		q, err := buildSlice(ctx, pq, sliceSpec{
+			predicate: fmt.Sprintf("ORA_HASH(ROWID, %d) = %d", buckets-1, k),
+		})
+		if err != nil {
+			t.Fatalf("buildSlice: %v", err)
+		}
 		n := querySingleString(ctx, t, cnxn, "SELECT COUNT(*) FROM ("+q+")")
 		var count int
 		if _, err := fmt.Sscanf(n, "%d", &count); err != nil {
