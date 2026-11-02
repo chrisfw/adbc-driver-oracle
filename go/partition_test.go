@@ -545,3 +545,62 @@ func TestFlashbackUnusable(t *testing.T) {
 		t.Error("a network error was treated as a flashback problem")
 	}
 }
+
+// A query whose expressions nest even moderately deeply used to defeat the
+// embedded parser. The WASI module was linked with the default 1 MiB stack, so
+// a sum of forty columns overflowed it while parsing or generating, and in
+// WASM that reaches the host as "out of bounds memory access" with no message.
+// The driver could only read it as the parser being unavailable and fall back
+// to an unsplit read, so the cost was silent: correct data, no parallelism, no
+// explanation.
+//
+// The module now links a 64 MiB stack and bounds request depth explicitly.
+// This test is what would catch a rebuild from an older or differently
+// configured source.
+func TestClassifyAndBuildSurviveDeepExpressions(t *testing.T) {
+	ctx := context.Background()
+
+	for _, terms := range []int{10, 40, 61, 120, 250} {
+		columns := make([]string, terms)
+		for i := range columns {
+			columns[i] = "c" + itoa(i)
+		}
+		sql := "SELECT " + strings.Join(columns, " + ") + " AS total FROM T1 WHERE c0 > 0"
+
+		q, err := classifyQuery(ctx, sql)
+		if err != nil {
+			t.Errorf("%d terms: classify: %v", terms, err)
+			continue
+		}
+		got, err := buildSlice(ctx, q, sliceSpec{scn: "123", predicate: "ORA_HASH(ROWID, 3) = 1"})
+		if err != nil {
+			t.Errorf("%d terms: buildSlice: %v", terms, err)
+			continue
+		}
+		// The slice still has to carry everything it was given.
+		for _, want := range []string{"AS OF SCN 123", "ORA_HASH(ROWID, 3) = 1", "c0 > 0", "AS total"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("%d terms: the slice lost %q: %s", terms, want, got)
+			}
+		}
+	}
+}
+
+// Past the depth the module supports, the answer has to be a reported error
+// rather than a trap, so the planner can fall back to an unsplit read with a
+// reason instead of reporting the parser as broken.
+func TestClassifyReportsRatherThanTrappingOnAbsurdNesting(t *testing.T) {
+	ctx := context.Background()
+
+	// Deep enough that the parser's own guard refuses it well before the
+	// protocol's depth bound comes into play.
+	sql := "SELECT " + strings.Repeat("(", 2000) + "1" + strings.Repeat(")", 2000) + " FROM T1"
+	_, err := classifyQuery(ctx, sql)
+	if err == nil {
+		t.Fatal("a query nested 2000 levels deep was accepted")
+	}
+	if strings.Contains(err.Error(), "out of bounds memory access") {
+		t.Errorf("the parser trapped rather than reporting a reason: %v", err)
+	}
+	t.Logf("reported: %v", err)
+}

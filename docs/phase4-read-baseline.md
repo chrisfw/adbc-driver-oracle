@@ -445,3 +445,31 @@ is the measurement environment rather than the change.
 The honest summary is that parallel extract is consistently faster than serial
 on this setup, by somewhere between 2x and 4.7x depending on how fast the
 serial baseline happens to be, and that a single number would be a fiction.
+
+### A bug the driver inherited, found by upstream review
+
+Review of the two polyglot pull requests turned up a defect that reached the
+driver. The WASI target was linked with the default 1 MiB stack, where
+polyglot's other WASM target already used 64 MiB for the stated reason that
+WASM has no `stacker` support. A query whose expressions nest even moderately
+deeply, such as a sum of forty columns, overflowed it:
+
+```
+SELECT c0 + c1 + ... + c39 AS total FROM t
+  -> wasm error: out of bounds memory access
+```
+
+The consequence in the driver was not wrong data. A trap is not a
+`splitRefusal`, so `ExecutePartitions` reported the parser as unavailable and
+fell back to one unsplit read, which is correct. But the cost was silent:
+moderately complex queries lost all parallelism with nothing to indicate why,
+which is the exact failure the parser was adopted to avoid.
+
+Fixed upstream by linking the same stack, plus an explicit request-depth bound
+so that input past what the module can handle gets a reported error rather than
+a trap. The bound is 1536 JSON levels, chosen from measurement: the parser
+emits at most ~1006, and decoding overflows from ~2406.
+
+`go/wasm/polyglot_sql.wasm` is now built from `b7a6b3b37255`. Two regression
+tests cover it, and the comment in `go/sqlanalyzer.go` warns against rebuilding
+from an earlier commit.
