@@ -34,8 +34,14 @@ Tested against Oracle Autonomous DB (Ashburn), FIRES_WORLDWIDE table (333K rows,
 ## Installing
 
 ```bash
-go get github.com/chrisfw/adbc-driver-oracle@v0.3.3
+go get github.com/chrisfw/adbc-driver-oracle@latest
 ```
+
+Or pin a release from the
+[tags](https://github.com/chrisfw/adbc-driver-oracle/tags). A version is not
+named here on purpose: it went stale three times in a day, and a stale number
+in install instructions is worse than none, because it reads as a
+recommendation to pin something old.
 
 Then add one `replace` to your `go.mod`:
 
@@ -84,7 +90,7 @@ The package builds with `CGO_ENABLED=0`.
 
 ### What a consumer inherits
 
-Verified by building a fresh module against `v0.3.1`:
+Verified by building a fresh module against the driver:
 
 | | |
 | --- | --- |
