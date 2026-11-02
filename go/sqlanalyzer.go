@@ -76,17 +76,28 @@ import (
 //	cp target/wasm32-wasip1/release/polyglot_sql_wasi.wasm \
 //	   <driver>/go/wasm/polyglot_sql.wasm
 //
-// The module in the tree was built from chrisfw/polyglot at b7a6b3b37255,
-// which carries the Oracle flashback support this driver needs. Those changes
-// are upstream pull requests tobilg/polyglot#518 and #519; once they are
-// released the module can come from an upstream build instead.
+// The module in the tree was built from chrisfw/polyglot, branch wasi-module,
+// at e07fa38b7572. That branch is upstream main plus the WASI crate and
+// nothing else: the Oracle flashback support this driver depends on is now
+// upstream's own, so the only outstanding fork is the packaging. It is
+// upstream pull request tobilg/polyglot#519, after which the module can come
+// from an upstream build.
 //
-// Do not replace it with a module built before that commit. Earlier builds
-// linked the WASI target with the default 1 MiB stack, and a query whose
-// expressions nest even moderately deeply, such as a sum of forty columns,
-// overflowed it. In WASM that reaches the host as "out of bounds memory
-// access" with no message, and the driver could only treat it as the parser
-// being unavailable and fall back to an unsplit read.
+// Do not replace it with a module built before that commit. Two defects were
+// fixed there and both are quiet:
+//
+//   - Earlier builds linked the WASI target with the default 1 MiB stack, and
+//     a query whose expressions nest even moderately deeply, such as a sum of
+//     forty columns, overflowed it. In WASM that reaches the host as "out of
+//     bounds memory access" with no message, and the driver could only treat
+//     it as the parser being unavailable and fall back to an unsplit read.
+//   - Earlier builds accepted trailing content after a request, so a
+//     truncated or concatenated payload was indistinguishable from a complete
+//     one.
+//
+// Checking the module is the module you think it is: the string
+// "trailing content" appears in a build that carries the second fix. A stale
+// artifact otherwise looks identical and simply performs worse.
 //
 //go:embed wasm/polyglot_sql.wasm
 var polyglotFS embed.FS

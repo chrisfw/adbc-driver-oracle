@@ -180,7 +180,9 @@ Exit criterion: at least 3x the Phase 4 baseline rows/s on the benchmark table, 
 > **REVISED 2026-11-01.** Classification and slice rewriting now parse the
 > query with polyglot rather than matching its text, which lets queries with
 > comments and optimizer hints be split instead of silently falling back.
-> Required two upstream polyglot changes (tobilg/polyglot#518 and #519).
+> Required two upstream polyglot changes. The Oracle parsing half landed on
+> polyglot main via the maintainer's #522, which superseded #518, so only the
+> WASI packaging (#519) is still carried as a fork.
 
 - Implement `ExecutePartitions`: given a query over a single table, split by partition (ALL_TAB_PARTITIONS), else by ROWID ranges from DBMS_PARALLEL_EXECUTE-style extent chunking, else by `ORA_HASH(ROWID, n-1)`.
 - Partition descriptors are serialised bytes; `ReadPartition` on any connection executes its slice.

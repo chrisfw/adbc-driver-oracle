@@ -380,9 +380,22 @@ upstream:
   host can embed one portable artifact instead of locating a platform-specific
   native library at run time.
 
-Until those are released, `go/wasm/polyglot_sql.wasm` is built from the fork.
-The header comment in `go/sqlanalyzer.go` records the commit and the rebuild
-command.
+**Update, 2026-11-02.** #518 was closed, superseded by the maintainer's
+[#522](https://github.com/tobilg/polyglot/pull/522), which carried the
+contribution forward rebased onto current main, resolved the parser conflicts
+while preserving main's subpartition support, and fixed a timestamp conversion
+gap this driver's version had missed: the guard here was scoped to SCN on the
+reasoning that `AS OF TIMESTAMP` always has an equivalent, and there are
+targets where it does not.
+
+The practical effect is that **upstream main now carries the Oracle work**,
+verified by round-tripping every form this driver emits against `origin/main`.
+So the driver no longer depends on a forked parser at all. The only outstanding
+fork is the WASI packaging, #519.
+
+Until #519 is released, `go/wasm/polyglot_sql.wasm` is built from the fork's
+`wasi-module` branch, which is upstream main plus the WASI crate. The header
+comment in `go/sqlanalyzer.go` records the commit and the rebuild command.
 
 ### Cost
 
@@ -488,6 +501,6 @@ so that input past what the module can handle gets a reported error rather than
 a trap. The bound is 1536 JSON levels, chosen from measurement: the parser
 emits at most ~1006, and decoding overflows from ~2406.
 
-`go/wasm/polyglot_sql.wasm` is now built from `b7a6b3b37255`. Two regression
+`go/wasm/polyglot_sql.wasm` is now built from `e07fa38b7572`. Two regression
 tests cover it, and the comment in `go/sqlanalyzer.go` warns against rebuilding
-from an earlier commit.
+from an earlier commit and says how to tell one build from another.
