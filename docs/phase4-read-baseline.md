@@ -427,24 +427,42 @@ when the requested count exceeds the pool.
 
 Re-measured after the change, on the same machine and fixture:
 
-| Readers | Session A | Session B |
+| Readers | Wall clock | Speedup |
 | --- | --- | --- |
-| serial | 1.17s to 1.25s | 876ms to 892ms |
-| 1 slice | 0.91x to 1.00x | 0.97x to 1.00x |
-| 2 slices | 2.51x to 2.63x | 1.55x to 1.68x |
-| 4 slices | 4.32x to 4.69x | 2.19x to 2.22x |
-| 8 slices | 4.13x to 4.20x | 2.33x to 2.38x |
+| serial | 973ms to 1.15s | 1.00x |
+| 1 slice | 1.14s to 1.22s | 0.82x to 1.01x |
+| 2 slices | 468ms to 516ms | 1.89x to 2.45x |
+| 4 slices | 249ms to 281ms | 3.46x to 4.61x |
+| 8 slices | 207ms to 246ms | 4.69x to 4.79x |
 
-Both sessions were internally stable across three runs, and the single slice
-control held at roughly 1.00x in both, which is what makes the comparison
-sound. The ratios differ because the serial baseline moved by 1.4x between
-sessions on an idle laptop, and the absolute parallel times moved too (400ms
-against 265ms at four slices). The generated SQL is identical in both, so this
-is the measurement environment rather than the change.
+This agrees with the measurement taken before the parser change, which is the
+expected result: the generated slice SQL is byte for byte identical, so there
+was nothing for it to change.
 
-The honest summary is that parallel extract is consistently faster than serial
-on this setup, by somewhere between 2x and 4.7x depending on how fast the
-serial baseline happens to be, and that a single number would be a fiction.
+An earlier revision of this document reported 2.19x to 2.22x at four slices and
+explained the gap as the serial baseline drifting on an idle laptop. That was
+wrong, and the way it was wrong is worth recording. The laptop was not idle.
+Four orphaned `cargo test` child processes were pinning a core each, three of
+them for over sixteen hours, left behind by killing `cargo` without killing the
+test binaries it had spawned. Every number in that revision was taken on a
+machine with most of its cores saturated.
+
+Two lessons, and the second is the useful one:
+
+- Killing `cargo test` does not kill the test binary it spawned. It reparents
+  to init and keeps running. `pkill -f <test-binary-name>` is what actually
+  stops it.
+- "The environment shifted" is not an explanation, it is the absence of one.
+  Taking it as the answer is what allowed a measurement from a saturated
+  machine to be written down as a finding, and then published. A contended
+  machine is a cause that can be checked in one command, which is less work
+  than the paragraph that was written instead.
+
+The single slice control held at roughly 1.00x in both the contended and the
+idle measurements, which is worth noting: it confirms the code paths are
+equivalent, but it did not reveal the contention, because contention scales
+serial and parallel together. A control for the comparison is not a control for
+the machine.
 
 ### A bug the driver inherited, found by upstream review
 
