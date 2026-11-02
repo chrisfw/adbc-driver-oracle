@@ -1,4 +1,4 @@
-module github.com/codeflowvt/adbc-driver-oracle
+module github.com/chrisfw/adbc-driver-oracle
 
 go 1.26.0
 

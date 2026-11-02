@@ -65,7 +65,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/cdata"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/arrow/memory/mallocator"
-	oracle "github.com/codeflowvt/adbc-driver-oracle/go"
+	oracle "github.com/chrisfw/adbc-driver-oracle/go"
 )
 
 // Must use malloc() to respect CGO rules

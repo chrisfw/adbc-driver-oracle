@@ -153,7 +153,7 @@ Build a benchmark first: `go/benchmark_test.go` already exists; extend it with a
 
 ### 4.2 Columnar decode in our own go-ora fork
 
-- Fork go-ora under codeflowvt, starting from jatorre's commit currently pinned in `go.mod`, so the UDT fixes from PR #721 come with it. Repoint the `replace`.
+- Fork go-ora under chrisfw, starting from jatorre's commit currently pinned in `go.mod`, so the UDT fixes from PR #721 come with it. Repoint the `replace`.
 - Add a fetch API that hands raw column buffers for each fetched row block to a decoder interface, bypassing `driver.Value` boxing.
 - Implement decoders in this repo that write straight into Arrow builders: NUMBER bytes to Decimal128/Int64 without going through a string; DATE/TIMESTAMP bytes to epoch integers; VARCHAR2 bytes appended directly to the string builder's value buffer.
 - Keep the database/sql path as a fallback behind `oracle.fetch_mode=sql|columnar`, default `columnar` once it passes the Phase 3 type suite byte-for-byte.
@@ -194,7 +194,12 @@ Tests: union of all partitions equals the full query result (row count and check
 - Makefile: add `build-windows` producing `adbc_driver_oracle.dll` (`GOOS=windows`, cgo with mingw-w64), and arm64 targets for macOS and Linux.
 - CI: add the Oracle Free 23ai service container and run integration tests with `ORACLE_TEST_DSN`. Add `-race` to unit tests.
 - Write a driver manifest TOML for ADBC driver-manager discovery.
-- Update README import paths from `jatorre` to `codeflowvt`, and document all options.
+- Update README import paths from `jatorre` to `chrisfw`, and document all options.
+
+> **NOTE 2026-11-02.** The module path is `github.com/chrisfw/adbc-driver-oracle`,
+> matching the public repository. It was briefly `codeflowvt`, which named a
+> repository that does not exist, so `go get` could not resolve it and every
+> consumer needed a `replace` pointing at a local clone.
 
 ## Out of scope for this plan
 
