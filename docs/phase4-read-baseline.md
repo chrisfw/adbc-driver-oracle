@@ -313,3 +313,135 @@ the whole table at the snapshot, and pinned into every descriptor.
 The integration test proves this is not vacuous. Stripped of its pinned types,
 the last slice of the fixture announces `decimal(38, 1)` for a column the
 caller was promised as `decimal(38, 4)`.
+
+## 4.3 revisited: parsing the query instead of matching its text
+
+The first implementation of 4.3 decided whether a query could be split, and
+rewrote it into slices, with a hand-written scanner over the SQL text. That
+worked but was conservative in a way that cost real parallelism, and its
+failure mode was the wrong kind: a rewrite that misreads a query returns
+plausible wrong data rather than failing.
+
+The driver now parses the query with [polyglot](https://github.com/tobilg/polyglot),
+a Rust SQL parser and generator with an Oracle dialect, reached from Go as a
+WebAssembly module run by [wazero](https://github.com/tetratelabs/wazero).
+
+### What this buys
+
+**Queries that were silently refused now split.** The scanner rejected every
+query containing a comment or an optimizer hint, because it did not parse
+comments. Both are common in hand-written extract SQL, and rejecting them cost
+the caller all parallelism with no indication why:
+
+| Query | Before | Now |
+| --- | --- | --- |
+| `SELECT /*+ FULL(t) */ a FROM t` | one partition | split, hint preserved in every slice |
+| `SELECT a FROM t -- nightly` | one partition | split |
+| `SELECT a FROM t WHERE b = 'ORDER BY'` | one partition | split |
+| `SELECT ORDER_TOTAL FROM t` | one partition | split |
+
+**Operator precedence stops being this driver's problem.** A slice predicate is
+ANDed into the query's WHERE clause by modifying the AST, so the generator
+decides the parentheses. A caller's `WHERE a > 5 OR b IS NULL` comes back as
+`WHERE (a > 5 OR b IS NULL) AND <predicate>`. The scanner got this right only
+because it parenthesised unconditionally; the AST gets it right by construction.
+
+**Classification is structural.** Every refusal is now a field on the parsed
+query (`distinct`, `group_by`, `order_by`, `limit`, `offset`, `fetch`,
+`qualify`, `windows`, `connect`, `locks`, `joins`, `sample`) or a node kind in
+its tree (`count`, `sum`, `window_function`, and polyglot's `aggregate_function`
+catch-all). That maps one to one onto what the regexps were approximating,
+without the false positives.
+
+The generated SQL is unchanged. A slice built from the AST is byte for byte
+what the scanner produced for the same input, which is how this was checked
+for regressions.
+
+### What it does not buy
+
+Joins and subqueries are still refused, and that is not a parsing limitation.
+`AS OF SCN` attaches to one table reference, so splitting a join would mean
+emitting the clause on every table reference, and the planner would have to
+choose a driving table. That is a feature, not a side effect of better parsing.
+
+### Upstream changes this required
+
+polyglot's Oracle dialect could not represent a flashback query, which is the
+one clause every slice must carry. Two changes were needed, both submitted
+upstream:
+
+- [tobilg/polyglot#518](https://github.com/tobilg/polyglot/pull/518): parse and
+  generate `AS OF SCN` and `AS OF TIMESTAMP`, and fix Oracle partition
+  selection, which was mis-parsed as a table aliased `PARTITION` carrying a
+  column alias list. That regenerated correctly, so only an AST assertion
+  caught it.
+- [tobilg/polyglot#519](https://github.com/tobilg/polyglot/pull/519): a WASI
+  module exposing parse, generate, transpile and format over JSON, so a Go
+  host can embed one portable artifact instead of locating a platform-specific
+  native library at run time.
+
+Until those are released, `go/wasm/polyglot_sql.wasm` is built from the fork.
+The header comment in `go/sqlanalyzer.go` records the commit and the rebuild
+command.
+
+### Cost
+
+| | |
+| --- | --- |
+| embedded module | 29 MB (5.5 MB in git, compressed) |
+| driver shared library | 51 MB to 83 MB |
+| cgo | still not required: wazero is pure Go |
+
+Translating 29 MB of WebAssembly to machine code is the one expensive part, so
+it happens once, lazily, only when a query is actually partitioned, and is
+cached on disk under `os.UserCacheDir()`:
+
+| | init | per call |
+| --- | --- | --- |
+| compiled, cold | 10.6s | 534 µs |
+| compiled, cached | **207 ms** | 288 µs |
+| interpreted | 739 ms | 7.7 ms |
+
+Under `-race`, which this project's tests use, a cold compile costs **2m32s**
+and a cached one 3.1s. That is why the cache is not optional: without it every
+test run touching partitioning stalls for over two minutes. It also explains a
+confusing symptom seen while building this: a single integration test appearing
+to take 150 seconds with an idle database.
+
+Planning a partitioned read costs 24ms to 39ms, against 16ms to 32ms before,
+plus roughly 310ms once per process for the analyzer. Both are small against
+the read itself.
+
+### A footgun found while measuring
+
+Reading N partitions concurrently on one database needs a pool that holds N
+connections. `oracle.pool_size` defaults to 8, so a caller requesting more
+slices than that will find the last `Open` blocking until an earlier reader
+finishes, or deadlocking if it waits for all of them before closing any.
+
+The driver cannot cap this, because ADBC allows partitions to be read in other
+processes entirely, so `ExecutePartitions` logs a warning naming both numbers
+when the requested count exceeds the pool.
+
+### The speedup, measured again
+
+Re-measured after the change, on the same machine and fixture:
+
+| Readers | Session A | Session B |
+| --- | --- | --- |
+| serial | 1.17s to 1.25s | 876ms to 892ms |
+| 1 slice | 0.91x to 1.00x | 0.97x to 1.00x |
+| 2 slices | 2.51x to 2.63x | 1.55x to 1.68x |
+| 4 slices | 4.32x to 4.69x | 2.19x to 2.22x |
+| 8 slices | 4.13x to 4.20x | 2.33x to 2.38x |
+
+Both sessions were internally stable across three runs, and the single slice
+control held at roughly 1.00x in both, which is what makes the comparison
+sound. The ratios differ because the serial baseline moved by 1.4x between
+sessions on an idle laptop, and the absolute parallel times moved too (400ms
+against 265ms at four slices). The generated SQL is identical in both, so this
+is the measurement environment rather than the change.
+
+The honest summary is that parallel extract is consistently faster than serial
+on this setup, by somewhere between 2x and 4.7x depending on how fast the
+serial baseline happens to be, and that a single number would be a fiction.

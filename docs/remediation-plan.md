@@ -176,6 +176,11 @@ Exit criterion: at least 3x the Phase 4 baseline rows/s on the benchmark table, 
 >   back to one unsplit read.
 >
 > See `docs/phase4-read-baseline.md` for the numbers.
+>
+> **REVISED 2026-11-01.** Classification and slice rewriting now parse the
+> query with polyglot rather than matching its text, which lets queries with
+> comments and optimizer hints be split instead of silently falling back.
+> Required two upstream polyglot changes (tobilg/polyglot#518 and #519).
 
 - Implement `ExecutePartitions`: given a query over a single table, split by partition (ALL_TAB_PARTITIONS), else by ROWID ranges from DBMS_PARALLEL_EXECUTE-style extent chunking, else by `ORA_HASH(ROWID, n-1)`.
 - Partition descriptors are serialised bytes; `ReadPartition` on any connection executes its slice.
