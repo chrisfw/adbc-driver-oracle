@@ -34,7 +34,7 @@ Tested against Oracle Autonomous DB (Ashburn), FIRES_WORLDWIDE table (333K rows,
 ## Installing
 
 ```bash
-go get github.com/chrisfw/adbc-driver-oracle@v0.3.1
+go get github.com/chrisfw/adbc-driver-oracle@v0.3.3
 ```
 
 Then add one `replace` to your `go.mod`:
@@ -133,6 +133,43 @@ stmt.SetSqlQuery("SELECT * FROM my_table")
 reader, _, _ := stmt.ExecuteQuery(ctx)
 // reader is an Arrow RecordReader with geoarrow.wkb geometry columns
 ```
+
+### Converting rows you already hold
+
+A caller that manages its own sessions (its own connector, a read-only
+transaction, named binds) can still use the driver's Oracle→Arrow conversion:
+
+```go
+rows, _ := tx.QueryContext(ctx, sqlText, args...) // any go-ora *sql.Rows
+reader, err := oracle.NewRowsReader(ctx, nil, rows, oracle.RowsReaderOptions{
+    NumberMapping: oracle.NumberMappingDecimal, // "" = the driver default
+    BatchRowLimit: 10000,                       // 0 = the driver default
+})
+```
+
+Columns get the same Arrow types `ExecuteQuery` gives with the same options.
+The reader owns `rows` and closes them when released.
+
+### Masking hook (optional)
+
+The `go/mask` package wraps any Arrow record reader so every batch is masked
+column by column before anyone reads it: pass a column through, mask it
+(keyed HMAC tokens, partial formats, redaction) or withhold it.
+
+```go
+import "github.com/chrisfw/adbc-driver-oracle/go/mask"
+
+plan := mask.Plan{
+    {Disposition: mask.PassRaw},
+    mask.MaskColumn(mask.KindGovID, mask.StyleToken, true, ""),
+    {Disposition: mask.Withhold},
+}
+masked, err := mask.Wrap(reader, plan, key, nil) // key: at least 16 bytes
+```
+
+It is opt-in by import. Nothing else in this module imports it (a test
+enforces that), so a build that never imports `go/mask` contains none of it.
+The driver package and the C shared library are unchanged by it.
 
 ## Bound parameters
 
