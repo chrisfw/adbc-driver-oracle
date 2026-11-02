@@ -31,6 +31,57 @@ Tested against Oracle Autonomous DB (Ashburn), FIRES_WORLDWIDE table (333K rows,
 | Baseline (oracledb + WKT) | 11,200 rows/sec |
 | Speedup | **5.4x** |
 
+## Installing
+
+```bash
+go get github.com/chrisfw/adbc-driver-oracle@v0.3.0
+```
+
+Then add one `replace` to your `go.mod`:
+
+```
+replace github.com/sijms/go-ora/v2 => github.com/jatorre/go-ora/v2 v2.9.1-0.20260719131444-0a202851613c
+```
+
+**This is required, not optional.** The driver needs a patched go-ora, and Go
+ignores `replace` directives declared by a dependency: only the main module's
+replaces apply. Without it the build fails on
+
+```
+connector.WithWallet undefined (type *go_ora.OracleConnector has no field or method WithWallet)
+```
+
+which is an unhelpful way to be told a dependency is the wrong version. Two
+things in the fork are needed and only one of them is visible at compile time:
+
+- `WithWallet`, which is the error above.
+- Fixes for UDT and VARRAY binds, which compile fine against upstream and then
+  fail at run time. A polygon with more than about sixteen vertices raises
+  ORA-00600; a bulk insert of `SDO_GEOMETRY` with mixed NULL rows raises
+  ORA-03146; a SELECT including NULL geometry desyncs the result stream.
+
+So a build that compiles without the `replace` is not a build that works.
+
+Removing this requirement means publishing the go-ora fork under its own module
+path so it can be required directly rather than substituted. That is tracked in
+`docs/remediation-plan.md` and is not done yet.
+
+### Minimal consumer
+
+```go
+import (
+    "github.com/apache/arrow-go/v18/arrow/memory"
+    oracle "github.com/chrisfw/adbc-driver-oracle/go"
+)
+
+drv := oracle.NewDriver(memory.DefaultAllocator)
+db, err := drv.NewDatabase(map[string]string{
+    oracle.OptionDSN: "oracle://user:pass@host:1521/SERVICE",
+})
+```
+
+The package builds with `CGO_ENABLED=0`.
+
 ## Usage
 
 ### CLI test harness
