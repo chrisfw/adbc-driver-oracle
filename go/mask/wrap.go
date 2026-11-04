@@ -131,3 +131,29 @@ func (r *maskedReader) RecordBatch() arrow.RecordBatch { return r.cur }
 func (r *maskedReader) Record() arrow.RecordBatch { return r.cur }
 
 func (r *maskedReader) Err() error { return r.err }
+
+// MaskArray masks one column per c, as Wrap does a column of a batch: the
+// result is a string column, NULL stays NULL. c must be a Mask or Withhold
+// entry that passes Validate; a token style needs a key of at least 16 bytes.
+func MaskArray(col arrow.Array, c ColumnPlan, key []byte, alloc memory.Allocator) (arrow.Array, error) {
+	if alloc == nil {
+		alloc = memory.DefaultAllocator
+	}
+	var k kernel
+	switch c.Disposition {
+	case Mask:
+		var err error
+		if k, err = kernelFor(c); err != nil {
+			return nil, fmt.Errorf("mask: %w", err)
+		}
+		if c.Style == StyleToken && len(key) < 16 {
+			return nil, fmt.Errorf("mask: the column tokenizes but the key is shorter than 16 bytes")
+		}
+	case Withhold:
+		k = func(string, []byte) string { return WithheldText }
+	default:
+		return nil, fmt.Errorf("mask: MaskArray needs a mask or withhold column, not %q", c.Disposition)
+	}
+	r := &maskedReader{key: key, alloc: alloc}
+	return r.apply(k, col), nil
+}

@@ -6,6 +6,7 @@ require (
 	github.com/adbc-drivers/driverbase-go/driverbase v0.0.0-20260409004641-0e8d426bb483
 	github.com/apache/arrow-adbc/go/adbc v1.11.0
 	github.com/apache/arrow-go/v18 v18.8.0
+	github.com/capitalone/fpe v1.2.1
 	github.com/sijms/go-ora/v2 v2.8.24
 )
 
