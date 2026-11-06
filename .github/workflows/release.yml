@@ -34,12 +34,19 @@ jobs:
             runner: macos-latest
             goarch: amd64
             artifact: libadbc_driver_oracle_darwin_amd64.dylib
+          - name: windows-amd64
+            runner: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            cc: x86_64-w64-mingw32-gcc
+            cross_pkg: gcc-mingw-w64-x86-64
+            artifact: libadbc_driver_oracle_windows_amd64.dll
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
 
       - name: Install cross-compiler
         if: matrix.cross_pkg
@@ -48,12 +55,13 @@ jobs:
       - name: Build shared library
         env:
           CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
           if [ -n "${{ matrix.cc }}" ]; then
             export CC="${{ matrix.cc }}"
           fi
-          go build -tags driverlib -buildmode=c-shared \
+          go build -tags driverlib -buildmode=c-shared -trimpath -ldflags '-s -w' \
             -o ${{ matrix.artifact }} ./pkg/oracle/
 
       - name: Upload artifact
@@ -75,7 +83,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          find . -type f \( -name '*.so' -o -name '*.dylib' \) -exec sha256sum {} \; | \
+          find . -type f \( -name '*.so' -o -name '*.dylib' -o -name '*.dll' \) -exec sha256sum {} \; | \
             sed 's|  \./[^/]*/|  |' > ../checksums.txt
           cat ../checksums.txt
 
@@ -86,4 +94,5 @@ jobs:
           files: |
             artifacts/**/*.so
             artifacts/**/*.dylib
+            artifacts/**/*.dll
             checksums.txt

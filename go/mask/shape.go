@@ -16,8 +16,11 @@ package mask
 //   - values stay away from the ranges the application will issue next. Each
 //     next-number counter (a frontier) marks where new numbers start; the run of
 //     unused values from there up to the next value in use is a free zone, and
-//     no masked value lands in one. Copied as they are, the counters stay valid
-//     and new test records never collide with masked ones.
+//     no value from outside a zone lands in one. Copied as they are, the
+//     counters stay valid and new test records never collide with masked ones.
+//   - a value found inside a free zone (an orphan: a child row whose master
+//     record is gone) is permuted within that zone, never passed through, so
+//     it cannot leak; it is counted (InFree) for the run report.
 //
 // Between free zones the values are permuted within their segment, so magnitudes
 // stay realistic and nothing crosses a counter. The unused values below the
@@ -87,7 +90,7 @@ const (
 	Masked  Outcome = iota // replaced by its masked value
 	Zero                   // 0 (or a zero high part): kept, it means "none"
 	Outside                // at or above 10^Width units: kept, and worth reporting
-	InFree                 // inside a free zone, so not a value in use: kept, and worth reporting
+	InFree                 // inside a free zone (an orphan value): masked within its zone, and worth reporting
 )
 
 // NewIdentifier builds the mask for one family. key is the customer's seed key
@@ -96,18 +99,9 @@ const (
 // allowed): the free zones are computed from it, so it must cover every column
 // that will be masked, or a value could be taken for free space.
 func NewIdentifier(key []byte, scope string, spec IdentifierSpec, occupied []uint64) (*Identifier, error) {
-	if len(key) < 16 {
-		return nil, fmt.Errorf("mask: the seed key is shorter than 16 bytes")
-	}
-	if spec.Unit == 0 {
-		spec.Unit = 1
-	}
-	if spec.Width < 2 || spec.Width > 18 {
-		return nil, fmt.Errorf("mask: %s: width %d is out of range", spec.Family, spec.Width)
-	}
-	limit := pow10(spec.Width)
-	if spec.Block != 0 && limit%spec.Block != 0 {
-		return nil, fmt.Errorf("mask: %s: block %d does not divide 10^%d", spec.Family, spec.Block, spec.Width)
+	limit, err := checkSpec(key, &spec)
+	if err != nil {
+		return nil, err
 	}
 	units := make([]uint64, 0, len(occupied))
 	for _, v := range occupied {
@@ -117,24 +111,67 @@ func NewIdentifier(key []byte, scope string, spec IdentifierSpec, occupied []uin
 	}
 	slices.Sort(units)
 	units = slices.Compact(units)
+	return newIdentifier(key, scope, spec, limit, freeZones(units, spec.Frontiers, spec.Unit, spec.Block, limit)), nil
+}
 
-	id := &Identifier{
+// NewIdentifierZones builds the mask for one family from free zones the caller
+// has already computed (for example in SQL, so no list of values in use ever
+// reaches the caller): each zone is [start, end) in units (value / Unit), and
+// zones may be given in any order and may overlap. spec.Frontiers is ignored.
+// Zones are clipped to [1, 10^Width); an empty or inverted zone is an error.
+func NewIdentifierZones(key []byte, scope string, spec IdentifierSpec, zones [][2]uint64) (*Identifier, error) {
+	limit, err := checkSpec(key, &spec)
+	if err != nil {
+		return nil, err
+	}
+	in := make([][2]uint64, 0, len(zones))
+	for _, z := range zones {
+		if z[0] >= z[1] {
+			return nil, fmt.Errorf("mask: %s: free zone [%d, %d) is empty", spec.Family, z[0], z[1])
+		}
+		z[0], z[1] = max(z[0], 1), min(z[1], limit)
+		if z[0] < z[1] {
+			in = append(in, z)
+		}
+	}
+	return newIdentifier(key, scope, spec, limit, mergeZones(in)), nil
+}
+
+func checkSpec(key []byte, spec *IdentifierSpec) (uint64, error) {
+	if len(key) < 16 {
+		return 0, fmt.Errorf("mask: the seed key is shorter than 16 bytes")
+	}
+	if spec.Unit == 0 {
+		spec.Unit = 1
+	}
+	if spec.Width < 2 || spec.Width > 18 {
+		return 0, fmt.Errorf("mask: %s: width %d is out of range", spec.Family, spec.Width)
+	}
+	limit := pow10(spec.Width)
+	if spec.Block != 0 && limit%spec.Block != 0 {
+		return 0, fmt.Errorf("mask: %s: block %d does not divide 10^%d", spec.Family, spec.Block, spec.Width)
+	}
+	return limit, nil
+}
+
+func newIdentifier(key []byte, scope string, spec IdentifierSpec, limit uint64, free [][2]uint64) *Identifier {
+	return &Identifier{
 		spec:  spec,
 		limit: limit,
-		free:  freeZones(units, spec.Frontiers, spec.Unit, spec.Block, limit),
+		free:  free,
 		tweak: []byte(scope + "|" + spec.Family),
 		ffKey: derive(key, "xdb-seed/ff1/v1"),
 		tbKey: derive(key, "xdb-seed/table/v1"),
 		perms: map[[2]uint64]perm{},
 		memo:  map[uint64]uint64{},
 	}
-	return id, nil
 }
 
 // FreeZones reports the free zones, in units, for the run report.
 func (id *Identifier) FreeZones() [][2]uint64 { return slices.Clone(id.free) }
 
-// Mask returns v's masked value. Only Masked changes the value.
+// Mask returns v's masked value. Masked and InFree change the value; Zero and
+// Outside keep it.
 func (id *Identifier) Mask(v uint64) (uint64, Outcome) {
 	hi, lo := v/id.spec.Unit, v%id.spec.Unit
 	switch {
@@ -145,12 +182,13 @@ func (id *Identifier) Mask(v uint64) (uint64, Outcome) {
 	}
 	id.mu.Lock()
 	defer id.mu.Unlock()
-	if m, ok := id.memo[hi]; ok {
-		return m*id.spec.Unit + lo, Masked
+	a, b, free := id.segment(hi)
+	out := Masked
+	if free {
+		out = InFree
 	}
-	a, b, ok := id.segment(hi)
-	if !ok {
-		return v, InFree
+	if m, ok := id.memo[hi]; ok {
+		return m*id.spec.Unit + lo, out
 	}
 	p, ok := id.perms[[2]uint64{a, b}]
 	if !ok {
@@ -159,12 +197,14 @@ func (id *Identifier) Mask(v uint64) (uint64, Outcome) {
 	}
 	m := a + p.apply(hi-a)
 	id.memo[hi] = m
-	return m*id.spec.Unit + lo, Masked
+	return m*id.spec.Unit + lo, out
 }
 
-// segment returns the segment [a, b) holding unit u, or false when u lies in a
-// free zone. Unit 0 is never part of a segment (it maps to itself).
-func (id *Identifier) segment(u uint64) (a, b uint64, ok bool) {
+// segment returns the range [a, b) that unit u is permuted within: the free
+// zone holding u (free is true), else the run between free zones. With blocks
+// either is clipped to u's block. Unit 0 is never part of a range (it maps to
+// itself).
+func (id *Identifier) segment(u uint64) (a, b uint64, free bool) {
 	// The first free zone that ends after u.
 	i, _ := slices.BinarySearchFunc(id.free, u, func(z [2]uint64, u uint64) int {
 		if z[1] <= u {
@@ -178,9 +218,10 @@ func (id *Identifier) segment(u uint64) (a, b uint64, ok bool) {
 	}
 	if i < len(id.free) {
 		if id.free[i][0] <= u {
-			return 0, 0, false
+			a, b, free = id.free[i][0], id.free[i][1], true
+		} else {
+			b = id.free[i][0]
 		}
-		b = id.free[i][0]
 	}
 	if blk := id.spec.Block; blk != 0 {
 		a = max(a, u/blk*blk)
@@ -189,7 +230,7 @@ func (id *Identifier) segment(u uint64) (a, b uint64, ok bool) {
 			a = 1
 		}
 	}
-	return a, b, true
+	return a, b, free
 }
 
 // freeZones turns frontiers into free zones: from the first value at or above
@@ -231,6 +272,11 @@ func freeZones(units, frontiers []uint64, unit, block, limit uint64) [][2]uint64
 		}
 		zones = append(zones, [2]uint64{s, e})
 	}
+	return mergeZones(zones)
+}
+
+// mergeZones sorts zones and merges the ones that touch or overlap.
+func mergeZones(zones [][2]uint64) [][2]uint64 {
 	slices.SortFunc(zones, func(x, y [2]uint64) int {
 		switch {
 		case x[0] < y[0]:

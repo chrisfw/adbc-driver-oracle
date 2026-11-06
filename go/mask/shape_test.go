@@ -31,7 +31,7 @@ func inFree(id *Identifier, u uint64) bool {
 
 // Over a whole small domain: every unit outside the free zones maps to a unit
 // outside them, one to one, and nothing crosses a counter.
-func TestIdentifierIsABijectionOutsideFreeZones(t *testing.T) {
+func TestIdentifierIsABijection(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2))
 	var occupied []uint64
 	for u := uint64(1); u < 10000; u++ {
@@ -46,12 +46,18 @@ func TestIdentifierIsABijectionOutsideFreeZones(t *testing.T) {
 		t.Fatalf("free zones = %v, want two", id.FreeZones())
 	}
 	seen := map[uint64]uint64{}
+	freeSeen := map[uint64]uint64{}
 	for u := uint64(1); u < 10000; u++ {
 		m, o := id.Mask(u)
-		if inFree(id, u) {
-			if o != InFree || m != u {
-				t.Fatalf("free unit %d: got %d, %v", u, m, o)
+		if z, ok := zoneOf(id, u); ok {
+			// An orphan value in a free zone is permuted within that zone.
+			if o != InFree || m < z[0] || m >= z[1] {
+				t.Fatalf("free unit %d: got %d, %v; want inside %v", u, m, o, z)
 			}
+			if prev, dup := freeSeen[m]; dup {
+				t.Fatalf("free units %d and %d both mask to %d", prev, u, m)
+			}
+			freeSeen[m] = u
 			continue
 		}
 		if o != Masked {
@@ -297,5 +303,74 @@ func TestMaskArrayMatchesWrap(t *testing.T) {
 	}
 	if _, err := MaskArray(col, ColumnPlan{Disposition: Mask, Kind: KindEmail, Style: StyleToken}, nil, nil); err == nil {
 		t.Fatal("a token column without a key should be refused")
+	}
+}
+
+func zoneOf(id *Identifier, u uint64) ([2]uint64, bool) {
+	for _, z := range id.FreeZones() {
+		if u >= z[0] && u < z[1] {
+			return z, true
+		}
+	}
+	return [2]uint64{}, false
+}
+
+// Zones given directly mask exactly as the same zones computed from values in
+// use and counters.
+func TestIdentifierZonesMatchesComputedZones(t *testing.T) {
+	occupied := []uint64{3, 4, 5, 9, 10, 40, 41, 42, 70}
+	spec := IdentifierSpec{Family: "cis", Unit: 1, Width: 2, Frontiers: []uint64{11, 43}}
+	computed := newID(t, "amo", spec, occupied)
+	given, err := NewIdentifierZones(testKey, "amo", IdentifierSpec{Family: "cis", Unit: 1, Width: 2},
+		// out of order and overlapping; merged to the same zones
+		[][2]uint64{{43, 70}, {11, 40}, {1, 3}, {12, 20}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(computed.FreeZones(), given.FreeZones()) {
+		t.Fatalf("zones %v, want %v", given.FreeZones(), computed.FreeZones())
+	}
+	for u := uint64(0); u < 100; u++ {
+		a, ao := computed.Mask(u)
+		b, bo := given.Mask(u)
+		if a != b || ao != bo {
+			t.Fatalf("unit %d: computed %d (%v), given %d (%v)", u, a, ao, b, bo)
+		}
+	}
+}
+
+func TestIdentifierZonesRejectsBadInput(t *testing.T) {
+	spec := IdentifierSpec{Family: "cis", Unit: 1, Width: 4}
+	if _, err := NewIdentifierZones(testKey, "amo", spec, [][2]uint64{{5, 5}}); err == nil {
+		t.Fatal("an empty zone was accepted")
+	}
+	if _, err := NewIdentifierZones(testKey[:8], "amo", spec, nil); err == nil {
+		t.Fatal("a short key was accepted")
+	}
+	// Clipped to [1, 10^Width).
+	id, err := NewIdentifierZones(testKey, "amo", spec, [][2]uint64{{0, 3}, {9000, 20000}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if z := id.FreeZones(); !slices.Equal(z, [][2]uint64{{1, 3}, {9000, 10000}}) {
+		t.Fatalf("zones %v", z)
+	}
+}
+
+// With route blocks, an orphan in a free zone keeps its block (its route).
+func TestFreeZoneOrphanKeepsItsBlock(t *testing.T) {
+	spec := IdentifierSpec{Family: "account", Unit: 1000, Width: 9, Block: 10000}
+	id, err := NewIdentifierZones(testKey, "amo", spec, [][2]uint64{{120005000, 120020000}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for u := uint64(120005000); u < 120020000; u += 7 {
+		m, o := id.Mask(u*1000 + 120)
+		if o != InFree || m%1000 != 120 || (m/1000)/10000 != u/10000 {
+			t.Fatalf("unit %d -> %d (%v)", u, m, o)
+		}
+		if mu := m / 1000; mu < 120005000 || mu >= 120020000 {
+			t.Fatalf("unit %d left its zone: %d", u, mu)
+		}
 	}
 }
