@@ -317,7 +317,9 @@ func (d regexDetector) Detect(text string) []Span {
 // character, as the whole rune does.)
 func digitWindows(text string) [][2]int {
 	isDigit := func(c byte) bool { return c >= '0' && c <= '9' }
-	isSep := func(c byte) bool { return c == ' ' || c == '-' || c == '.' || c == '/' || c == '(' || c == ')' || c == '+' }
+	isSep := func(c byte) bool {
+		return c == ' ' || c == '-' || c == '.' || c == '/' || c == '(' || c == ')' || c == '+'
+	}
 	var out [][2]int
 	for i := 0; i < len(text); {
 		if !isDigit(text[i]) {
@@ -376,7 +378,9 @@ func atWindows(text string) [][2]int {
 	}
 }
 
-func isSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' }
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'
+}
 
 // phoneDigits is a phone's ten digits: a leading US country code is dropped.
 func phoneDigits(s string) string {

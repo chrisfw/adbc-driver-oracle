@@ -131,7 +131,9 @@ func TestScrubFailsClosed(t *testing.T) {
 		t.Fatalf("panic: %q %+v", got, n)
 	}
 	// A detector that returns a bad span fails the value closed.
-	bad := detectorFunc(func(string) []Span { return []Span{{Start: 5, End: 2, Kind: "x", Replace: func(string) (string, error) { return "", nil }}} })
+	bad := detectorFunc(func(string) []Span {
+		return []Span{{Start: 5, End: 2, Kind: "x", Replace: func(string) (string, error) { return "", nil }}}
+	})
 	s2 := newTestScrubber(t, bad)
 	if got, n := s2.Scrub("hello world"); got != DefaultRedaction || n.FailedClosed != 1 {
 		t.Fatalf("bad span: %q %+v", got, n)
@@ -157,7 +159,9 @@ func (f detectorFunc) Detect(v string) []Span { return f(v) }
 // lower case).
 func TestScrubTokensMatchColumnKernel(t *testing.T) {
 	s := newTestScrubber(t)
-	col := func(kind Kind, v string) string { return run(t, ColumnPlan{Disposition: Mask, Kind: kind, Style: StyleToken}, v) }
+	col := func(kind Kind, v string) string {
+		return run(t, ColumnPlan{Disposition: Mask, Kind: kind, Style: StyleToken}, v)
+	}
 	for _, c := range []struct {
 		kind       Kind
 		text, norm string
