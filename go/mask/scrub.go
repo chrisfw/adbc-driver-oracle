@@ -227,8 +227,8 @@ func resolve(spans []Span) []Span {
 }
 
 // ScrubArray scrubs a string column (string or large string; anything else
-// is refused) into a string column. NULL stays NULL. The detectors are chosen
-// once for the column and run over every value.
+// is refused) into a column of the same type. NULL stays NULL. The detectors
+// are chosen once for the column and run over every value.
 func ScrubArray(col arrow.Array, s *Scrubber, alloc memory.Allocator) (arrow.Array, ScrubCounts, error) {
 	var n ScrubCounts
 	if s == nil {
@@ -245,9 +245,17 @@ func ScrubArray(col arrow.Array, s *Scrubber, alloc memory.Allocator) (arrow.Arr
 	if !ok || (col.DataType().ID() != arrow.STRING && col.DataType().ID() != arrow.LARGE_STRING) {
 		return nil, n, fmt.Errorf("mask: only text can be scrubbed, not %s", col.DataType())
 	}
-	b := array.NewStringBuilder(alloc)
+	b := array.NewBuilder(alloc, col.DataType())
 	defer b.Release()
 	b.Reserve(sa.Len())
+	appendStr := func(v string) {
+		switch sb := b.(type) {
+		case *array.StringBuilder:
+			sb.Append(v)
+		case *array.LargeStringBuilder:
+			sb.Append(v)
+		}
+	}
 	for i := 0; i < sa.Len(); i++ {
 		if sa.IsNull(i) {
 			n.Nulls++
@@ -256,7 +264,7 @@ func ScrubArray(col arrow.Array, s *Scrubber, alloc memory.Allocator) (arrow.Arr
 		}
 		out, c := s.Scrub(sa.Value(i))
 		n.Add(c)
-		b.Append(out)
+		appendStr(out)
 	}
 	return b.NewArray(), n, nil
 }
