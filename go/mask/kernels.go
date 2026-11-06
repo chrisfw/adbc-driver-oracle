@@ -83,6 +83,25 @@ func kernelFor(c ColumnPlan) (kernel, error) {
 		case KindSSN, KindEmail, KindPhone, KindName, KindAddress, KindDOB, KindGovID, KindCard, KindGeneric:
 			return redact, nil
 		}
+	case StyleScrub:
+		if c.Scrubber == nil {
+			return nil, fmt.Errorf("a scrub column needs a scrubber (the connection's key and identifier masks)")
+		}
+		sc := c.Scrubber
+		return func(v string, _ []byte) string { out, _ := sc.Scrub(v); return out }, nil
+	case StyleIdentifier:
+		if c.Identifier == nil {
+			return nil, fmt.Errorf("an identifier column needs the site's identifier mask")
+		}
+		id := c.Identifier
+		return func(v string, _ []byte) string {
+			x, ok := digitsValue(v)
+			if !ok {
+				return red // not a whole number: fail closed, never the value
+			}
+			m, _ := id.Mask(x)
+			return padLike(v, m)
+		}, nil
 	case StyleFormat:
 		switch c.Kind {
 		case KindEmail:

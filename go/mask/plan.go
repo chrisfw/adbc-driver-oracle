@@ -58,6 +58,14 @@ const (
 	StyleToken  Style = "token"  // keyed pseudonym; equal values give equal tokens
 	StyleFormat Style = "format" // kind-specific partial reveal
 	StyleRedact Style = "redact" // the redaction text
+	// StyleScrub is free text with the personal data inside it masked and the
+	// rest kept (scrub.go). It needs ColumnPlan.Scrubber.
+	StyleScrub Style = "scrub"
+	// StyleIdentifier is a numbered identifier (account, CIS, premise number)
+	// replaced by its structure-preserving mask (shape.go), in the column's
+	// text form. It needs ColumnPlan.Identifier. A value that is not a
+	// non-negative whole number becomes the redaction text.
+	StyleIdentifier Style = "identifier"
 )
 
 // DefaultRedaction and WithheldText are the replacement texts.
@@ -74,6 +82,11 @@ type ColumnPlan struct {
 	// Redaction replaces values under StyleRedact (and KindGeneric/KindAddress
 	// formats); empty means DefaultRedaction.
 	Redaction string
+	// Scrubber scrubs a StyleScrub column; Identifier masks a StyleIdentifier
+	// column. Both are built per connection (they hold the key and the site's
+	// identifier masks), never read from rules.
+	Scrubber   *Scrubber
+	Identifier *Identifier
 }
 
 // Plan has one entry per output column, in output order.
