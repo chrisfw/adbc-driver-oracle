@@ -107,7 +107,7 @@ func NewScrubber(key []byte, redaction string, extra ...Detector) (*Scrubber, er
 		redaction = DefaultRedaction
 	}
 	k := append([]byte(nil), key...)
-	ds := []Detector{regexDetector{k}}
+	ds := []Detector{regexDetector{key: k}}
 	for _, d := range extra {
 		if d == nil {
 			return nil, errors.New("mask: a nil detector")
@@ -115,6 +115,61 @@ func NewScrubber(key []byte, redaction string, extra ...Detector) (*Scrubber, er
 		ds = append(ds, d)
 	}
 	return &Scrubber{detectors: ds, redaction: redaction}, nil
+}
+
+// NewScrubberFakes is NewScrubber with replacements by kind (fakes) instead
+// of tokens, for seeding a database: notes keep reading naturally, with the
+// same fakes as the columns. Identifier families (extra) still use their
+// Identifier, as their columns do.
+func NewScrubberFakes(key []byte, redaction string, fakes ScrubFakes, extra ...Detector) (*Scrubber, error) {
+	s, err := NewScrubber(key, redaction, extra...)
+	if err != nil {
+		return nil, err
+	}
+	rd := s.detectors[0].(regexDetector)
+	f := fakes
+	rd.fakes = &f
+	s.detectors[0] = rd
+	return s, nil
+}
+
+// FakeCards makes fake card numbers in text: the layout kept, the digits
+// keyed, the last one a Luhn check digit (so detectors and validators still
+// see a card number), never the input. Safe for concurrent use.
+type FakeCards struct{ k keyed }
+
+// NewFakeCards keys fake card numbers with key (at least 16 bytes).
+func NewFakeCards(key []byte) (*FakeCards, error) {
+	if len(key) < 16 {
+		return nil, errors.New("mask: the fake-card key is shorter than 16 bytes")
+	}
+	return &FakeCards{k: keyed{derive(key, "xdb-fake/card/v1")}}, nil
+}
+
+// Text fakes a card number written with any separators.
+func (f *FakeCards) Text(v string) (string, error) {
+	out, ok := digitsInPlace(v, func(d string) (string, bool) {
+		if len(d) < 12 {
+			return "", false
+		}
+		for n := uint32(0); ; n++ {
+			var b strings.Builder
+			b.WriteByte(d[0]) // the network digit stays
+			for i := 1; i < len(d)-1; i++ {
+				b.WriteByte(byte('0' + f.k.u64("card", d, n*64+uint32(i))%10))
+			}
+			body := b.String()
+			for c := byte('0'); c <= '9'; c++ {
+				if cand := body + string(c); luhn(cand) && cand != d {
+					return cand, true
+				}
+			}
+		}
+	})
+	if !ok {
+		return "", errors.New("mask: not a card number")
+	}
+	return out, nil
 }
 
 // Failures is how many values this scrubber has failed closed on so far.
@@ -280,7 +335,37 @@ var (
 	abaRe   = regexp.MustCompile(`\b\d{9}\b`)
 )
 
-type regexDetector struct{ key []byte }
+type regexDetector struct {
+	key   []byte
+	fakes *ScrubFakes // replacements by kind instead of tokens (NewScrubberFakes)
+}
+
+// ScrubFakes are a scrubber's replacements by kind, for a seeded database:
+// each gets a detected value's text and returns its fake (the caller passes
+// the same fakes its columns use, so a phone in a note becomes what that
+// phone becomes in a phone column). A kind left nil is tokenized.
+type ScrubFakes struct {
+	Email, Phone, SSN, Card, Routing func(string) (string, error)
+}
+
+func (f *ScrubFakes) of(kind string) func(string) (string, error) {
+	if f == nil {
+		return nil
+	}
+	switch kind {
+	case "email":
+		return f.Email
+	case "phone":
+		return f.Phone
+	case "ssn":
+		return f.SSN
+	case "card":
+		return f.Card
+	case "routing":
+		return f.Routing
+	}
+	return nil
+}
 
 func (d regexDetector) tokenOf(norm func(string) string) func(string) (string, error) {
 	return func(text string) (string, error) {
@@ -298,7 +383,11 @@ func (d regexDetector) Detect(text string) []Span {
 		for _, m := range re.FindAllStringIndex(text[win[0]:win[1]], -1) {
 			a, b := win[0]+m[0], win[0]+m[1]
 			if ok == nil || ok(text[a:b]) {
-				out = append(out, Span{Start: a, End: b, Kind: kind, Score: 1, Replace: d.tokenOf(norm)})
+				rep := d.tokenOf(norm)
+				if fk := d.fakes.of(kind); fk != nil {
+					rep = fk
+				}
+				out = append(out, Span{Start: a, End: b, Kind: kind, Score: 1, Replace: rep})
 			}
 		}
 	}
