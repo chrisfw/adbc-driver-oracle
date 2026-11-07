@@ -1,6 +1,7 @@
 package mask
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -149,5 +150,45 @@ func TestFakeEmail(t *testing.T) {
 	}
 	if f.Fake("") != "" || f.Fake("   ") != "   " {
 		t.Fatal("blank changed")
+	}
+}
+
+func TestFakePhoneDemoExchanges(t *testing.T) {
+	f, err := NewFakePhones(testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Area = map[string]string{"603": "302"}
+	f.Exchange = map[string]string{"224": "391"}
+	full, ok := f.Digits("6032241234")
+	if !ok || full[:6] != "302391" || full == "3023911234" {
+		t.Fatalf("relocated: %q", full)
+	}
+	// The split column (local number alone) agrees with the whole number.
+	if loc := f.Local("2241234"); loc != full[3:] {
+		t.Fatalf("split %q vs whole %q", loc, full)
+	}
+	// Deterministic, and a different line gets a different fake line.
+	if again, _ := f.Digits("6032241234"); again != full {
+		t.Fatal("not deterministic")
+	}
+	// Every line of the exchange gets its own fake line.
+	seen := map[string]bool{}
+	for line := 0; line < 10000; line++ {
+		v, _ := f.Digits(fmt.Sprintf("603224%04d", line))
+		if seen[v] {
+			t.Fatalf("two lines, one fake: %s", v)
+		}
+		seen[v] = true
+	}
+	// An unmapped exchange, and toll-free numbers, keep 555-01xx.
+	if v, _ := f.Digits("6039991234"); v[:8] != "30255501" {
+		t.Fatalf("unmapped exchange: %q", v)
+	}
+	if v, _ := f.Digits("18002241234"); v[:9] != "180055501" {
+		t.Fatalf("toll-free: %q", v)
+	}
+	if v, ok := f.Text("(603) 224-1234 x12"); !ok || v != "("+full[:3]+") "+full[3:6]+"-"+full[6:]+" x12" {
+		t.Fatalf("text: %q", v)
 	}
 }

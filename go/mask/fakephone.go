@@ -11,6 +11,14 @@ package mask
 //
 // Only 100 fakes exist per area code: searching a seeded database by phone
 // finds many customers. That is the price of numbers that can never ring.
+//
+// The demo profile relocates numbers instead: Area maps area codes and
+// Exchange maps the 3-digit exchange to one NANPA lists as not assigned in
+// the target's area code, so a number looks local and still reaches no one;
+// the line is then a keyed permutation of the real line within its exchange,
+// so distinct numbers stay distinct. Both are keyed by the local number alone,
+// as above, so split columns stay consistent. Toll-free numbers and
+// exchanges Exchange does not name keep 555-01xx.
 
 import (
 	"crypto/hmac"
@@ -21,6 +29,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -34,7 +43,15 @@ type FakePhones struct {
 	// Area, when set, replaces an area code (the demo profile's relocation);
 	// codes it does not name are kept.
 	Area map[string]string
+	// Exchange, when set, replaces an exchange (the first 3 digits of the
+	// local number) with an unassigned one, the line becoming 4 keyed
+	// digits; exchanges it does not name get 555-01xx.
+	Exchange map[string]string
+	lines    sync.Map // real exchange -> its line permutation
 }
+
+// tollFree are the toll-free area codes: their numbers keep 555-01xx.
+var tollFree = map[string]bool{"800": true, "833": true, "844": true, "855": true, "866": true, "877": true, "888": true}
 
 // NewFakePhones keys fake phone numbers with key (at least 16 bytes).
 func NewFakePhones(key []byte) (*FakePhones, error) {
@@ -44,11 +61,67 @@ func NewFakePhones(key []byte) (*FakePhones, error) {
 	return &FakePhones{key: derive(key, "xdb-fake/phone/v1")}, nil
 }
 
-// Local is the fake of a 7-digit local number (exchange and line): 55501xx.
+// Local is the fake of a 7-digit local number (exchange and line): 55501xx,
+// or, with Exchange naming its exchange, that exchange and a keyed line.
 func (f *FakePhones) Local(local string) string {
 	m := hmac.New(sha256.New, f.key)
 	m.Write([]byte(local))
-	xx := binary.BigEndian.Uint64(m.Sum(nil)) % 100
+	sum := m.Sum(nil)
+	if len(local) == 7 {
+		if ex, ok := f.Exchange[local[:3]]; ok && len(ex) == 3 {
+			if line, err := strconv.Atoi(local[3:]); err == nil {
+				// A keyed permutation of the exchange's lines: with a
+				// one-to-one Exchange, distinct numbers stay distinct.
+				return fmt.Sprintf("%s%04d", ex, f.linePerm(local[:3])[line])
+			}
+		}
+	}
+	return f.fiction(local, sum)
+}
+
+// linePerm is the keyed permutation of the 10,000 lines of a real exchange.
+func (f *FakePhones) linePerm(exchange string) []uint16 {
+	if p, ok := f.lines.Load(exchange); ok {
+		return p.([]uint16)
+	}
+	p := make([]uint16, 10000)
+	for i := range p {
+		p[i] = uint16(i)
+	}
+	var ctr uint64
+	var buf []byte
+	next := func(n uint64) uint64 { // a keyed uniform draw in [0, n)
+		for {
+			if len(buf) < 8 {
+				m := hmac.New(sha256.New, f.key)
+				m.Write([]byte("lines/" + exchange))
+				m.Write(binary.BigEndian.AppendUint64(nil, ctr))
+				ctr++
+				buf = m.Sum(nil)
+			}
+			v := binary.BigEndian.Uint64(buf)
+			buf = buf[8:]
+			if lim := ^uint64(0) - ^uint64(0)%n; v < lim {
+				return v % n
+			}
+		}
+	}
+	for i := len(p) - 1; i > 0; i-- {
+		j := next(uint64(i + 1))
+		p[i], p[j] = p[j], p[i]
+	}
+	got, _ := f.lines.LoadOrStore(exchange, p)
+	return got.([]uint16)
+}
+
+// fiction is 55501xx keyed by the local number.
+func (f *FakePhones) fiction(local string, sum []byte) string {
+	if sum == nil {
+		m := hmac.New(sha256.New, f.key)
+		m.Write([]byte(local))
+		sum = m.Sum(nil)
+	}
+	xx := binary.BigEndian.Uint64(sum) % 100
 	out := fmt.Sprintf("55501%02d", xx)
 	if out == local {
 		out = fmt.Sprintf("55501%02d", (xx+1)%100)
@@ -75,8 +148,14 @@ func (f *FakePhones) Digits(d string) (string, bool) {
 	case len(d) == 7:
 		return f.Local(d), true
 	case len(d) == 10:
+		if tollFree[d[:3]] {
+			return d[:3] + f.fiction(d[3:], nil), true
+		}
 		return f.area(d[:3]) + f.Local(d[3:]), true
 	case len(d) == 11 && d[0] == '1':
+		if tollFree[d[1:4]] {
+			return "1" + d[1:4] + f.fiction(d[4:], nil), true
+		}
 		return "1" + f.area(d[1:4]) + f.Local(d[4:]), true
 	}
 	return "", false
