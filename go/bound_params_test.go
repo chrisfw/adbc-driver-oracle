@@ -545,7 +545,9 @@ func TestIntegration_LobColumnsOfTableReadsDeclaredTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lobColumnsOfTable: %v", err)
 	}
-	want := []bool{false, false, true, true, false}
+	// A string for a CLOB/NCLOB binds as a CLOB; binary data for a BLOB
+	// binds as a BLOB (ORA-01461 otherwise, beside another long value).
+	want := []bool{false, false, true, true, true}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
