@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 
 	"github.com/tetratelabs/wazero"
@@ -108,10 +109,28 @@ const polyglotModulePath = "wasm/polyglot_sql.wasm"
 //
 // Safe for concurrent use: wazero's runtime and compiled modules are, and each
 // request runs in a fresh instance with no shared state.
+//
+// Each instance's linear memory grows to a few hundred megabytes on a wide
+// statement and is only reclaimed when the instance ends, so concurrent
+// requests multiply it: a 4-session export planning 4 slices per table ran
+// 16 parses at once and held over 4 GB. analyzerSlots bounds how many run
+// together (parsing is short beside the reads it plans).
 type sqlAnalyzer struct {
 	runtime  wazero.Runtime
 	compiled wazero.CompiledModule
 }
+
+// AnalyzerConcurrencyEnv sets how many SQL parses may run at once
+// (default 2).
+const AnalyzerConcurrencyEnv = "ADBC_ORACLE_PARSER_CONCURRENCY"
+
+var analyzerSlots = func() chan struct{} {
+	n := 2
+	if v, err := strconv.Atoi(os.Getenv(AnalyzerConcurrencyEnv)); err == nil && v > 0 {
+		n = v
+	}
+	return make(chan struct{}, n)
+}()
 
 var (
 	analyzerOnce sync.Once
@@ -200,6 +219,13 @@ func (a *sqlAnalyzer) call(ctx context.Context, req polyglotRequest) (json.RawMe
 		return nil, err
 	}
 
+	select {
+	case analyzerSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-analyzerSlots }()
+
 	var stdout, stderr bytes.Buffer
 	config := wazero.NewModuleConfig().
 		WithStdin(bytes.NewReader(in)).
@@ -209,7 +235,14 @@ func (a *sqlAnalyzer) call(ctx context.Context, req polyglotRequest) (json.RawMe
 		// only be instantiated once at a time.
 		WithName("")
 
-	if _, err := a.runtime.InstantiateModule(ctx, a.compiled, config); err != nil {
+	// The instance must be closed: one whose main returns without proc_exit
+	// stays in the runtime with its linear memory (hundreds of MB after a
+	// wide statement), and every parse leaked one.
+	mod, err := a.runtime.InstantiateModule(ctx, a.compiled, config)
+	if mod != nil {
+		defer mod.Close(ctx)
+	}
+	if err != nil {
 		// A WASI command exits when main returns, which wazero reports as an
 		// ExitError. Exit code 0 is the normal path, not a failure.
 		exitErr, ok := err.(*sys.ExitError)
