@@ -334,23 +334,37 @@ func (s *statementImpl) ExecuteUpdate(ctx context.Context) (int64, error) {
 		if err != nil {
 			return -1, err
 		}
-
-		var result sql.Result
+		nrow := 1
+		if s.bindParams != nil && args != nil {
+			nrow = int(s.bindParams.NumRows())
+		}
+		var ex execer
 		if prepared != nil {
-			result, err = prepared.ExecContext(ctx, args...)
+			ex = prepared
 		} else {
 			sess, sessErr := s.cnxn.session(ctx)
 			if sessErr != nil {
 				return -1, sessErr
 			}
-			result, err = sess.ExecContext(ctx, s.query, args...)
+			ex = execerFunc(func(ctx context.Context, a ...any) (sql.Result, error) {
+				return sess.ExecContext(ctx, s.query, a...)
+			})
 		}
+		if nrow <= 1 {
+			result, err := ex.ExecContext(ctx, args...)
+			if err != nil {
+				return -1, s.ErrorHelper.WrapIO(err, "execute failed")
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return -1, s.ErrorHelper.WrapIO(err, "failed to get rows affected")
+			}
+			return affected, nil
+		}
+		// An array execute: in chunks go-ora can count (arrayexec.go).
+		affected, err := execArray(ctx, ex, args, nrow)
 		if err != nil {
 			return -1, s.ErrorHelper.WrapIO(err, "execute failed")
-		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return -1, s.ErrorHelper.WrapIO(err, "failed to get rows affected")
 		}
 		return affected, nil
 	}
@@ -848,7 +862,7 @@ func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec a
 		}
 	}
 
-	_, err = stmt.ExecContext(ctx, args...)
+	_, err = execArray(ctx, stmt, args, endRow-startRow)
 	if err != nil {
 		return 0, s.ErrorHelper.WrapIO(err, "batch insert failed")
 	}
@@ -972,7 +986,7 @@ func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string
 				return committed, err
 			}
 		}
-		if _, err := stmt.ExecContext(ctx, pb.args...); err != nil {
+		if _, err := execArray(ctx, stmt, pb.args, pb.nrow); err != nil {
 			commitErr := commit() // keep completed batches, like the old path
 			_ = commitErr
 			if isOraCode(err, 12899) {
@@ -1019,7 +1033,7 @@ func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL strin
 	}
 	defer stmt.Close()
 
-	_, err = stmt.ExecContext(ctx, args...)
+	_, err = execArray(ctx, stmt, args, numRows)
 	if err != nil {
 		if isOraCode(err, 12899) {
 			// A string wider than the scan window predicted slipped past the
@@ -1116,13 +1130,13 @@ func arrowColumnToSliceRange(arr arrow.Array, start, end int, asClob bool) inter
 	case *array.LargeString:
 		return stringColumnToSlice(a, start, end, asClob)
 	case *array.Binary:
-		return binaryColumnToSlice(a, start, end)
+		return binaryColumnToSlice(a, start, end, asClob)
 	case *array.LargeBinary:
-		return binaryColumnToSlice(a, start, end)
+		return binaryColumnToSlice(a, start, end, asClob)
 	case *array.FixedSizeBinary:
-		return binaryColumnToSlice(a, start, end)
+		return binaryColumnToSlice(a, start, end, asClob)
 	case *array.BinaryView:
-		return binaryColumnToSlice(a, start, end)
+		return binaryColumnToSlice(a, start, end, asClob)
 	case *array.Decimal128:
 		vals := make([]sql.NullString, numRows)
 		scale := a.DataType().(*arrow.Decimal128Type).Scale
@@ -1209,7 +1223,10 @@ func (s *statementImpl) resolveStringBinds(ctx context.Context, tableName string
 	stringCols := false
 	for _, f := range schema.Fields() {
 		switch f.Type.ID() {
-		case arrow.STRING, arrow.LARGE_STRING, arrow.STRING_VIEW:
+		case arrow.STRING, arrow.LARGE_STRING, arrow.STRING_VIEW,
+			arrow.BINARY, arrow.LARGE_BINARY, arrow.BINARY_VIEW, arrow.FIXED_SIZE_BINARY:
+			// binary columns too: one bound for a BLOB column goes in as a
+			// go_ora.Blob (arrowColumnToSliceRange)
 			stringCols = true
 		}
 	}
@@ -1256,7 +1273,7 @@ func clobBindsFromColTypes(schema *arrow.Schema, colTypes []string) []bool {
 	}
 	binds := make([]bool, schema.NumFields())
 	for i := range colTypes {
-		binds[i] = isClobDDLType(colTypes[i])
+		binds[i] = lobBind(schema.Field(i).Type, colTypes[i])
 	}
 	return binds
 }
@@ -1266,6 +1283,21 @@ func isClobDDLType(ddl string) bool {
 	switch strings.ToUpper(strings.TrimSpace(ddl)) {
 	case "CLOB", "NCLOB":
 		return true
+	}
+	return false
+}
+
+// lobBind reports whether a column of Arrow type dt bound for an Oracle
+// column of type ddl goes in as a LOB: a string for a CLOB/NCLOB (a
+// go_ora.Clob), binary data for a BLOB (a go_ora.Blob). Bound as plain bytes,
+// a BLOB value past the RAW limit travels as a LONG RAW, and Oracle refuses
+// it beside another long value (ORA-01461).
+func lobBind(dt arrow.DataType, ddl string) bool {
+	switch dt.ID() {
+	case arrow.STRING, arrow.LARGE_STRING, arrow.STRING_VIEW:
+		return isClobDDLType(ddl)
+	case arrow.BINARY, arrow.LARGE_BINARY, arrow.BINARY_VIEW, arrow.FIXED_SIZE_BINARY:
+		return strings.ToUpper(strings.TrimSpace(ddl)) == "BLOB"
 	}
 	return false
 }
@@ -1297,13 +1329,13 @@ func (s *statementImpl) lobColumnsOfTable(ctx context.Context, tableName string,
 	}
 	defer rows.Close()
 
-	lob := make(map[string]bool)
+	lob := make(map[string]string) // column -> declared type
 	for rows.Next() {
 		var name, dataType string
 		if err := rows.Scan(&name, &dataType); err != nil {
 			return nil, err
 		}
-		lob[strings.ToUpper(name)] = isClobDDLType(dataType)
+		lob[strings.ToUpper(name)] = dataType
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1314,7 +1346,7 @@ func (s *statementImpl) lobColumnsOfTable(ctx context.Context, tableName string,
 
 	binds := make([]bool, schema.NumFields())
 	for i, f := range schema.Fields() {
-		binds[i] = lob[strings.ToUpper(f.Name)]
+		binds[i] = lobBind(f.Type, lob[strings.ToUpper(f.Name)])
 	}
 	return binds, nil
 }
@@ -1384,7 +1416,20 @@ func stringColumnToSlice(a interface {
 func binaryColumnToSlice(a interface {
 	arrow.Array
 	Value(int) []byte
-}, start, end int) [][]byte {
+}, start, end int, asBlob bool) interface{} {
+	if asBlob {
+		// A BLOB column: a go_ora.Blob per row (NULL: Valid false).
+		lobs := make([]go_ora.Blob, end-start)
+		for i := start; i < end; i++ {
+			if !a.IsNull(i) {
+				src := a.Value(i)
+				dst := make([]byte, len(src))
+				copy(dst, src)
+				lobs[i-start] = go_ora.Blob{Data: dst, Valid: true}
+			}
+		}
+		return lobs
+	}
 	vals := make([][]byte, end-start)
 	for i := start; i < end; i++ {
 		if !a.IsNull(i) {
