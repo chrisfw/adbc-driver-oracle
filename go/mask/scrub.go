@@ -51,6 +51,29 @@ type Span struct {
 	Score      float64
 	// Replace returns the replacement for the span's text (after trimming).
 	Replace func(text string) (string, error)
+
+	// norm, set by the built-in detectors when Replace tokenizes, is the
+	// normalization the token is taken of, so ScrubSpans can report the
+	// value a token stands for. A caller's detector leaves it nil.
+	norm func(text string) string
+}
+
+// Replaced is one span a scrub replaced, for a caller that must map what the
+// reader sees back to what it stood for: a client that lets a token from a
+// note be used as a query filter learns token -> value from these, as it
+// learns them from the token columns it masks. It carries the real value, so
+// it is for the caller's memory only, never for a report or a log.
+type Replaced struct {
+	Kind        string // "email", "phone", "ssn", "card", "routing", or a caller detector's kind
+	Text        string // the span's text in the value, after trimming
+	Replacement string // what the span became
+	// Value is what a built-in token was taken of: Text normalized (e-mail
+	// lower-cased; SSN, card, phone and routing number as digits, a phone's
+	// US country code dropped), the value whose token column kernel gives
+	// Replacement. "" when Replacement is not such a token: a fake
+	// (NewScrubberFakes) or a caller's detector (identifier families, whose
+	// Text and Replacement are what the caller maps).
+	Value string
 }
 
 // Detector finds personal data in a text value. It must be safe for
@@ -178,15 +201,24 @@ func (s *Scrubber) Failures() int64 { return s.failures.Load() }
 // Scrub returns v with its personal data masked, and what it did. On any
 // error or panic it returns the redaction text and counts a failure.
 func (s *Scrubber) Scrub(v string) (out string, c ScrubCounts) {
+	out, _, c = s.ScrubSpans(v)
+	return out, c
+}
+
+// ScrubSpans is Scrub that also returns each replaced span, in text order.
+// A value that fails closed returns no spans.
+func (s *Scrubber) ScrubSpans(v string) (out string, spans []Replaced, c ScrubCounts) {
 	c.Values = 1
 	defer func() {
 		if r := recover(); r != nil {
 			out, c = s.failed()
+			spans = nil
 		}
 	}()
 	res, spans, err := s.scrub(v)
 	if err != nil {
-		return s.failed()
+		out, c = s.failed()
+		return out, nil, c
 	}
 	if len(spans) > 0 {
 		c.Changed = 1
@@ -196,7 +228,7 @@ func (s *Scrubber) Scrub(v string) (out string, c ScrubCounts) {
 			c.ByKind[sp.Kind]++
 		}
 	}
-	return res, c
+	return res, spans, c
 }
 
 func (s *Scrubber) failed() (string, ScrubCounts) {
@@ -204,7 +236,7 @@ func (s *Scrubber) failed() (string, ScrubCounts) {
 	return s.redaction, ScrubCounts{Values: 1, FailedClosed: 1}
 }
 
-func (s *Scrubber) scrub(v string) (string, []Span, error) {
+func (s *Scrubber) scrub(v string) (string, []Replaced, error) {
 	if s.fault != nil {
 		if err := s.fault(v); err != nil {
 			return "", nil, err
@@ -222,17 +254,23 @@ func (s *Scrubber) scrub(v string) (string, []Span, error) {
 		}
 	}
 	kept := resolve(spans)
+	done := make([]Replaced, len(kept))
 	// Right to left, so earlier offsets stay valid.
 	out := v
 	for i := len(kept) - 1; i >= 0; i-- {
 		sp := kept[i]
-		rep, err := sp.Replace(v[sp.Start:sp.End])
+		text := v[sp.Start:sp.End]
+		rep, err := sp.Replace(text)
 		if err != nil {
 			return "", nil, err
 		}
+		done[i] = Replaced{Kind: sp.Kind, Text: text, Replacement: rep}
+		if sp.norm != nil {
+			done[i].Value = sp.norm(text)
+		}
 		out = out[:sp.Start] + rep + out[sp.End:]
 	}
-	return out, kept, nil
+	return out, done, nil
 }
 
 // trimCut are the characters trimmed from span edges. @ - _ . / + are kept:
@@ -383,11 +421,11 @@ func (d regexDetector) Detect(text string) []Span {
 		for _, m := range re.FindAllStringIndex(text[win[0]:win[1]], -1) {
 			a, b := win[0]+m[0], win[0]+m[1]
 			if ok == nil || ok(text[a:b]) {
-				rep := d.tokenOf(norm)
+				sp := Span{Start: a, End: b, Kind: kind, Score: 1, Replace: d.tokenOf(norm), norm: norm}
 				if fk := d.fakes.of(kind); fk != nil {
-					rep = fk
+					sp.Replace, sp.norm = fk, nil
 				}
-				out = append(out, Span{Start: a, End: b, Kind: kind, Score: 1, Replace: rep})
+				out = append(out, sp)
 			}
 		}
 	}

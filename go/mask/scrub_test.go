@@ -421,3 +421,55 @@ func BenchmarkScrubNotes(b *testing.B) {
 	}
 	b.ReportMetric(float64(len(notes))*float64(b.N)/b.Elapsed().Seconds(), "rows/s")
 }
+
+// ScrubSpans reports each replaced span in text order: the built-in tokens
+// with the normalized value they were taken of (which tokenizes to the
+// replacement, as the token column kernel would), a caller detector's span
+// with its text and replacement only.
+func TestScrubSpans(t *testing.T) {
+	id := testAccountID(t, 0, [][2]uint64{{1, 100000}, {500000000, 1000000000}})
+	det, err := NewIdentifierDetector(testAccountForms("0259"), map[string]*Identifier{"account": id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestScrubber(t, det)
+	in := "Mail Jane.Doe@Example.com or call (802) 555-0142 re acct 123456789001"
+	out, spans, c := s.ScrubSpans(in)
+	if want, _ := s.Scrub(in); out != want {
+		t.Fatalf("ScrubSpans and Scrub differ:\n%q\n%q", out, want)
+	}
+	m, _ := id.Mask(123456789001)
+	want := []Replaced{
+		{Kind: "email", Text: "Jane.Doe@Example.com", Replacement: tok("jane.doe@example.com"), Value: "jane.doe@example.com"},
+		{Kind: "phone", Text: "802) 555-0142", Replacement: tok("8025550142"), Value: "8025550142"},
+		{Kind: "account", Text: "123456789001", Replacement: fmt.Sprintf("%012d", m)},
+	}
+	if len(spans) != len(want) || c.Spans != int64(len(want)) {
+		t.Fatalf("spans %+v, counts %+v", spans, c)
+	}
+	for i, w := range want {
+		if spans[i] != w {
+			t.Errorf("span %d:\n got %+v\nwant %+v", i, spans[i], w)
+		}
+		if !strings.Contains(out, spans[i].Replacement) {
+			t.Errorf("span %d's replacement is not in the output", i)
+		}
+	}
+	// The value of a token is what its column kernel tokenizes to it.
+	col := run(t, ColumnPlan{Disposition: Mask, Kind: KindPhone, Style: StyleToken}, spans[1].Value)
+	if col != spans[1].Replacement {
+		t.Errorf("phone column token %q, note token %q", col, spans[1].Replacement)
+	}
+
+	if _, spans, _ := s.ScrubSpans("nothing personal here"); len(spans) != 0 {
+		t.Errorf("spans in plain text: %+v", spans)
+	}
+	s.fault = func(string) error { return errors.New("forced") }
+	if out, spans, c := s.ScrubSpans(in); out != DefaultRedaction || spans != nil || c.FailedClosed != 1 {
+		t.Errorf("fail closed: %q %+v %+v", out, spans, c)
+	}
+	s.fault = func(string) error { panic("boom") }
+	if _, spans, c := s.ScrubSpans(in); spans != nil || c.FailedClosed != 1 {
+		t.Errorf("panic: %+v %+v", spans, c)
+	}
+}
