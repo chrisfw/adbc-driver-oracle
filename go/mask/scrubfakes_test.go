@@ -52,3 +52,23 @@ var errErr = &scrubErr{}
 type scrubErr struct{}
 
 func (*scrubErr) Error() string { return "no" }
+
+// A fake is not a token of anything: ScrubSpans reports no Value for it, and
+// still reports one for a kind left tokenized.
+func TestScrubSpansFakesHaveNoValue(t *testing.T) {
+	phones, _ := NewFakePhones(fakeTestKey)
+	s, err := NewScrubberFakes(fakeTestKey, "", ScrubFakes{Phone: func(v string) (string, error) {
+		out, ok := phones.Text(v)
+		if !ok {
+			return "", errErr
+		}
+		return out, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, spans, _ := s.ScrubSpans("callback 999-867-5309, ssn 123-45-6789")
+	if len(spans) != 2 || spans[0].Kind != "phone" || spans[0].Value != "" || spans[1].Kind != "ssn" || spans[1].Value != "123456789" {
+		t.Fatalf("%+v", spans)
+	}
+}
